@@ -280,12 +280,12 @@ async def stream_chat_with_document(
         docs_meta = [
             d
             for did in target_doc_ids
-            if (d := supabase_db.get_workspace_document(ctx.workspace_id, did)) is not None
+            if (d := await asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, did)) is not None
         ]
         if not docs_meta:
             raise HTTPException(status_code=404, detail="Requested document(s) not found in your workspace.")
     else:
-        docs_meta = supabase_db.list_workspace_documents(ctx.workspace_id)
+        docs_meta = await asyncio.to_thread(supabase_db.list_workspace_documents, ctx.workspace_id)
 
     async def event_generator():
         t_start = time.perf_counter()
@@ -308,13 +308,26 @@ async def stream_chat_with_document(
             retrieval_status = "insufficient_evidence"
 
             if has_docs:
-                search_outcome = await retrieval_service.search_hybrid(
-                    workspace_id=ctx.workspace_id,
-                    user_id=ctx.user_id,
-                    query=req.message,
-                    doc_ids=target_doc_ids if target_doc_ids else None,
-                    match_count=12 if len(target_doc_ids) > 1 else 8,
+                search_task = asyncio.create_task(
+                    retrieval_service.search_hybrid(
+                        workspace_id=ctx.workspace_id,
+                        user_id=ctx.user_id,
+                        query=req.message,
+                        doc_ids=target_doc_ids if target_doc_ids else None,
+                        match_count=12 if len(target_doc_ids) > 1 else 8,
+                    )
                 )
+                search_wait = 0.0
+                while not search_task.done():
+                    done_set, _ = await asyncio.wait({search_task}, timeout=8.0)
+                    if done_set:
+                        break
+                    search_wait += 8.0
+                    if search_wait >= 32.0:
+                        search_task.cancel()
+                        raise TimeoutError("Document retrieval timed out.")
+                    yield ": keepalive\n\n"
+                search_outcome = await search_task
                 retrieved_chunks = search_outcome["results"]
                 retrieval_status = search_outcome["retrieval_status"]
 
@@ -354,14 +367,30 @@ async def stream_chat_with_document(
                         user_message=req.message,
                     )
                     try:
-                        async for delta in ai_gateway.stream_text(
+                        aiter = ai_gateway.stream_text(
                             task_type=task_type,
                             workspace_id=ctx.workspace_id,
                             user_id=ctx.user_id,
                             instructions=ASSISTANT_GENERAL_INSTRUCTIONS,
                             input_blocks=prompt_input,
                             scope_key="general",
-                        ):
+                        ).__aiter__()
+                        while True:
+                            tok_task = asyncio.create_task(aiter.__anext__())
+                            waited = 0.0
+                            while not tok_task.done():
+                                done_set, _ = await asyncio.wait({tok_task}, timeout=8.0)
+                                if done_set:
+                                    break
+                                waited += 8.0
+                                if waited >= 32.0:
+                                    tok_task.cancel()
+                                    raise TimeoutError("AI stream stalled waiting for token.")
+                                yield ": keepalive\n\n"
+                            try:
+                                delta = await tok_task
+                            except StopAsyncIteration:
+                                break
                             accumulated.append(delta)
                             yield f"event: token_delta\ndata: {json.dumps({'delta': delta})}\n\n"
                     except Exception as exc:
@@ -403,14 +432,30 @@ async def stream_chat_with_document(
                 )
                 scope_key = ":".join(sorted(target_doc_ids)) if target_doc_ids else "repo"
                 try:
-                    async for delta in ai_gateway.stream_text(
+                    aiter = ai_gateway.stream_text(
                         task_type=task_type,
                         workspace_id=ctx.workspace_id,
                         user_id=ctx.user_id,
                         instructions=ASSISTANT_SYSTEM_INSTRUCTIONS,
                         input_blocks=prompt_input,
                         scope_key=scope_key,
-                    ):
+                    ).__aiter__()
+                    while True:
+                        tok_task = asyncio.create_task(aiter.__anext__())
+                        waited = 0.0
+                        while not tok_task.done():
+                            done_set, _ = await asyncio.wait({tok_task}, timeout=8.0)
+                            if done_set:
+                                break
+                            waited += 8.0
+                            if waited >= 32.0:
+                                tok_task.cancel()
+                                raise TimeoutError("AI stream stalled waiting for token.")
+                            yield ": keepalive\n\n"
+                        try:
+                            delta = await tok_task
+                        except StopAsyncIteration:
+                            break
                         accumulated.append(delta)
                         yield f"event: token_delta\ndata: {json.dumps({'delta': delta})}\n\n"
                 except Exception as exc:
@@ -436,7 +481,7 @@ async def stream_chat_with_document(
                     "stage": "verifying",
                     "orbState": "compacting",
                     "variant": "squeeze",
-                    "label": "Memverifikasi sitasi & halaman sumber...",
+                    "label": "Verifying citations & source pages...",
                     "chunks_found": len(retrieved_chunks),
                     "docs_searched": len(docs_meta),
                     "retrieval_status": retrieval_status,
@@ -459,7 +504,8 @@ async def stream_chat_with_document(
                     "How does automatic page citation work?",
                 ]
             )
-            saved_turn = supabase_db.save_conversation_turn(
+            saved_turn = await asyncio.to_thread(
+                supabase_db.save_conversation_turn,
                 workspace_id=ctx.workspace_id,
                 user_id=ctx.user_id,
                 conversation_id=req.conversation_id,
