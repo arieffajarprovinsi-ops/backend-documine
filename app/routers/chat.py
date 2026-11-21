@@ -80,6 +80,96 @@ def _resolve_target_doc_ids(req: ChatRequest) -> List[str]:
     return ids
 
 
+_BROAD_OVERVIEW_PATTERN = re.compile(
+    r"\b(summarize|summary|takeaway|takeaways|overview|key points?|main points?|highlights?|"
+    r"explain this|what is this|about this document|contents?|conclusion|insight|"
+    r"ringkas\w*|rangkum\w*|intisari|kesimpulan|poin utama|pokok|isi dokumen|"
+    r"tentang apa|jelaskan dokumen|analisa|analisis)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_broad_overview_query(message: str) -> bool:
+    return bool(_BROAD_OVERVIEW_PATTERN.search(message or ""))
+
+
+def _load_representative_chunks(
+    workspace_id: str,
+    docs_meta: List[Dict[str, Any]],
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Fetch evenly distributed representative chunks directly from scoped docs."""
+    collected: List[Dict[str, Any]] = []
+    if not docs_meta:
+        return collected
+    per_doc = max(2, limit // max(1, min(len(docs_meta), 5)))
+    for d in docs_meta[:5]:
+        did = str(d.get("id") or "")
+        if not did:
+            continue
+        raw_chunks = supabase_db.get_document_chunks(workspace_id, did) or []
+        if not raw_chunks:
+            continue
+        if len(raw_chunks) <= per_doc:
+            picked = raw_chunks
+        else:
+            step = (len(raw_chunks) - 1) / float(max(1, per_doc - 1))
+            idxs = sorted({round(i * step) for i in range(per_doc)})
+            picked = [raw_chunks[i] for i in idxs if 0 <= i < len(raw_chunks)]
+        doc_title = d.get("title") or "Document"
+        for ch in picked:
+            cid = str(ch.get("chunk_id") or ch.get("id") or "")
+            txt = (ch.get("text_content") or ch.get("content") or "").strip()
+            if not cid or not txt:
+                continue
+            collected.append(
+                {
+                    **ch,
+                    "chunk_id": cid,
+                    "doc_id": str(ch.get("doc_id") or ch.get("document_id") or did),
+                    "doc_title": ch.get("doc_title") or doc_title,
+                    "page_number": int(ch.get("page_number") or 1),
+                    "text_content": txt,
+                    "confidence_tier": "medium",
+                }
+            )
+    return collected[:limit]
+
+
+async def _backfill_scoped_evidence(
+    *,
+    workspace_id: str,
+    user_message: str,
+    docs_meta: List[Dict[str, Any]],
+    target_doc_ids: List[str],
+    retrieved_chunks: List[Dict[str, Any]],
+    retrieval_status: str,
+) -> tuple[List[Dict[str, Any]], str]:
+    """Ensure overview prompts or scoped single-doc requests still get representative chunks when vector/FTS hits are sparse."""
+    is_overview = _is_broad_overview_query(user_message)
+    needs_backfill = docs_meta and (
+        (not retrieved_chunks and (is_overview or len(target_doc_ids) >= 1))
+        or (is_overview and len(retrieved_chunks) < 3)
+    )
+    if not needs_backfill:
+        return retrieved_chunks, retrieval_status
+
+    rep_chunks = await asyncio.to_thread(_load_representative_chunks, workspace_id, docs_meta, 10)
+    if not rep_chunks:
+        return retrieved_chunks, retrieval_status
+
+    existing_ids = {str(c.get("chunk_id") or c.get("id")) for c in retrieved_chunks}
+    merged = list(retrieved_chunks)
+    for rc in rep_chunks:
+        rc_id = str(rc.get("chunk_id") or rc.get("id"))
+        if rc_id not in existing_ids:
+            merged.append(rc)
+            existing_ids.add(rc_id)
+
+    next_status = "grounded" if merged else retrieval_status
+    return merged[:12], next_status
+
+
 def _build_grounded_prompt(
     *,
     docs_meta: List[Dict[str, Any]],
@@ -140,9 +230,17 @@ def _deterministic_grounded_fallback_answer(
     """
     if not retrieved_chunks or retrieval_status == "insufficient_evidence":
         doc_titles = ", ".join(f'"{d.get("title")}"' for d in docs_meta[:3]) or "documents in your workspace"
+        summaries = [
+            f'- **{d.get("title") or "Document"}**: {(d.get("summary") or "").strip()}'
+            for d in docs_meta[:3]
+            if (d.get("summary") or "").strip()
+        ]
+        if summaries and _is_broad_overview_query(user_message):
+            return "Document overview based on indexed metadata:\n" + "\n".join(summaries)
         return (
-            f"After searching {doc_titles}, no specific information about "
-            f'"{user_message}" was found in the available document passages.'
+            f"After searching {doc_titles}, no extractable matching text passages were found for "
+            f'"{user_message}". If the file is a scanned image PDF without an OCR text layer or is empty, '
+            "try uploading a text-based PDF or re-indexing the document."
         )
 
     lines = ["Based on the evidence found in your documents:"]
@@ -190,6 +288,14 @@ async def chat_with_document(
     )
     retrieved_chunks = search_outcome["results"]
     retrieval_status = search_outcome["retrieval_status"]
+    retrieved_chunks, retrieval_status = await _backfill_scoped_evidence(
+        workspace_id=ctx.workspace_id,
+        user_message=req.message,
+        docs_meta=docs_meta,
+        target_doc_ids=target_doc_ids,
+        retrieved_chunks=retrieved_chunks,
+        retrieval_status=retrieval_status,
+    )
 
     # Choose task type based on complexity/scope (ADR-008)
     task_type = (
@@ -330,6 +436,14 @@ async def stream_chat_with_document(
                 search_outcome = await search_task
                 retrieved_chunks = search_outcome["results"]
                 retrieval_status = search_outcome["retrieval_status"]
+                retrieved_chunks, retrieval_status = await _backfill_scoped_evidence(
+                    workspace_id=ctx.workspace_id,
+                    user_message=req.message,
+                    docs_meta=docs_meta,
+                    target_doc_ids=target_doc_ids,
+                    retrieved_chunks=retrieved_chunks,
+                    retrieval_status=retrieval_status,
+                )
 
             task_type = (
                 AITaskType.GROUNDED_CHAT_DEEP

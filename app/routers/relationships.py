@@ -11,10 +11,25 @@ from app.ai.gateway import ai_gateway
 router = APIRouter(prefix="/relationships", tags=["relationships"])
 
 _STOPWORDS = {
+    # Indonesian function, connector, and generic structural words
     "yang", "dan", "atau", "dari", "untuk", "dengan", "pada", "dalam", "ini",
     "itu", "oleh", "sebagai", "adalah", "akan", "telah", "dapat", "juga",
+    "serta", "secara", "antara", "terhadap", "mengenai", "berdasarkan",
+    "tersebut", "melalui", "karena", "sehingga", "namun", "tetapi", "agar",
+    "supaya", "bahwa", "yaitu", "yakni", "maupun", "hingga", "sampai",
+    "selama", "sejak", "harus", "sudah", "belum", "bisa", "tidak", "bukan",
+    "lebih", "kurang", "masing", "semua", "setiap", "lain", "lainnya",
+    "bentuk", "kerja", "laporan", "menengah", "tahun", "mencakup", "kegiatan",
+    "pelaksanaan", "bagian", "umum", "khusus", "utama", "dasar", "lanjut",
+    "tingkat", "data", "informasi", "sistem", "program", "rencana", "hasil",
+    "evaluasi", "tujuan", "daftar", "berikut", "sesuai", "nomor", "tanggal",
+    "waktu", "tempat", "halaman", "tabel", "baik", "baru", "lama", "besar",
+    "kecil", "tinggi", "rendah", "awal", "akhir", "atas", "bawah",
+    # English stopwords & generic file tokens
     "the", "and", "for", "with", "from", "that", "this", "are", "was", "have",
-    "dokumen", "document", "file", "pdf", "csv", "txt", "halaman", "page",
+    "were", "been", "into", "about", "across", "using", "based", "between",
+    "dokumen", "document", "documents", "file", "files", "pdf", "csv", "txt",
+    "page", "report", "summary", "none", "untitled", "general",
 }
 
 
@@ -218,6 +233,7 @@ async def ai_connect_workspace_documents(
 
     plan_summary = ""
     saved_edges: List[Dict[str, Any]] = []
+    ai_evaluated = False
 
     if ai_gateway.is_openai_configured:
         try:
@@ -235,14 +251,16 @@ async def ai_connect_workspace_documents(
                     "You are the DocuMind Graph Relationship Architect. Examine the actual titles, summaries, topics, "
                     "and content excerpts of the workspace documents. Identify meaningful content connections "
                     "(shared organization/institution, complementary project scope, overlapping schedules/years, "
-                    "shared entities, technical dependencies, or contrasting evidence). Only emit pairs with genuine "
-                    "textual basis using the exact doc_id values provided. Pick relationship_type strictly from the "
-                    "allowed schema values and write clear 1-sentence explanations referencing actual details from both files."
+                    "shared named entities, technical dependencies, or contrasting evidence). Only emit pairs with genuine "
+                    "textual basis using the exact doc_id values provided; if documents are unrelated, return links=[]. "
+                    "Pick relationship_type strictly from the allowed schema values and write clear 1-sentence explanations "
+                    "referencing actual details from both files."
                 ),
                 input_blocks=prompt_input,
                 response_model=GraphAutoLinkPlan,
                 scope_key=f"graph_link:{ctx.workspace_id}:{len(analyzed_docs)}",
             )
+            ai_evaluated = True
             plan_summary = plan.summary or ""
             for item in plan.links:
                 if (
@@ -264,25 +282,25 @@ async def ai_connect_workspace_documents(
         except Exception as exc:
             print(f"[RelationshipsRouter] AI auto-connect fallback to deterministic content matcher: {exc}")
 
-    # Deterministic content + topic + lexical overlap matcher (runs if AI offline or returned 0 edges)
-    if not saved_edges:
+    # Deterministic content + topic overlap matcher (runs ONLY when AI is offline/unavailable)
+    if not ai_evaluated:
         for i in range(len(analyzed_docs)):
             d0 = analyzed_docs[i]
             id0 = str(d0["id"])
             kw0 = _extract_keywords(chunks_by_doc.get(id0, ""))
-            t0 = {t.lower() for t in (d0.get("main_topics") or []) if t}
+            t0 = {t.lower() for t in (d0.get("main_topics") or []) if t and t.lower() not in _STOPWORDS}
             for j in range(i + 1, len(analyzed_docs)):
                 d1 = analyzed_docs[j]
                 id1 = str(d1["id"])
                 kw1 = _extract_keywords(chunks_by_doc.get(id1, ""))
-                t1 = {t.lower() for t in (d1.get("main_topics") or []) if t}
+                t1 = {t.lower() for t in (d1.get("main_topics") or []) if t and t.lower() not in _STOPWORDS}
                 shared_topics = sorted(t0.intersection(t1))
                 shared_kw = sorted(kw0.intersection(kw1))
-                if shared_topics or len(shared_kw) >= 3:
-                    rel_type = "shared_topics" if shared_topics else "shared_entities"
-                    shared_list = shared_topics[:4] if shared_topics else shared_kw[:5]
+                if shared_topics or len(shared_kw) >= 6:
+                    rel_type = "shared_topics" if shared_topics else "semantic_similarity"
+                    shared_list = shared_topics[:4] if shared_topics else shared_kw[:6]
                     conf = min(0.94, 0.56 + 0.08 * len(shared_topics) + 0.03 * min(len(shared_kw), 8))
-                    expl = f"Content overlap detected across key terms/topics: {', '.join(shared_list)}."
+                    expl = f"Content overlap detected across domain terms/topics: {', '.join(shared_list)}."
                     edge = await asyncio.to_thread(
                         supabase_db.upsert_relationship,
                         workspace_id=ctx.workspace_id,
