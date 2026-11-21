@@ -876,20 +876,36 @@ class SupabaseManager:
                     updated = dict(r)
         return updated
 
-    def save_contradiction_relationship(
+    VALID_RELATIONSHIP_TYPES = {
+        "shared_topics",
+        "shared_entities",
+        "semantic_similarity",
+        "explicit_reference",
+        "shared_metric_lineage",
+        "contradiction_detected",
+        "composite_related",
+    }
+
+    def upsert_relationship(
         self,
         workspace_id: str,
         source_doc_id: str,
         target_doc_id: str,
+        relationship_type: str,
         explanation: str,
-        evidence_summary: Dict[str, Any],
-        confidence: float = 0.88,
+        evidence_summary: Optional[Dict[str, Any]] = None,
+        confidence: float = 0.78,
     ) -> Dict[str, Any]:
+        rel_type = (
+            relationship_type
+            if relationship_type in self.VALID_RELATIONSHIP_TYPES
+            else "composite_related"
+        )
         pair_lo, pair_hi = min(source_doc_id, target_doc_id), max(source_doc_id, target_doc_id)
         rel_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"rel:{workspace_id}:{pair_lo}:{pair_hi}:metric_contradiction:{explanation[:32]}",
+                f"rel:{workspace_id}:{pair_lo}:{pair_hi}:{rel_type}",
             )
         )
         edge = {
@@ -897,10 +913,10 @@ class SupabaseManager:
             "workspace_id": workspace_id,
             "source_doc_id": pair_lo,
             "target_doc_id": pair_hi,
-            "relationship_type": "metric_contradiction",
-            "composite_confidence": round(confidence, 3),
+            "relationship_type": rel_type,
+            "composite_confidence": round(max(0.1, min(0.99, float(confidence))), 3),
             "explanation": explanation,
-            "evidence_summary": evidence_summary,
+            "evidence_summary": evidence_summary or {},
             "is_dismissed": False,
             "created_at": _utc_now_iso(),
         }
@@ -916,6 +932,25 @@ class SupabaseManager:
             r for r in self._local_tables["document_relationships"] if r.get("id") != rel_id
         ] + [edge]
         return edge
+
+    def save_contradiction_relationship(
+        self,
+        workspace_id: str,
+        source_doc_id: str,
+        target_doc_id: str,
+        explanation: str,
+        evidence_summary: Dict[str, Any],
+        confidence: float = 0.88,
+    ) -> Dict[str, Any]:
+        return self.upsert_relationship(
+            workspace_id=workspace_id,
+            source_doc_id=source_doc_id,
+            target_doc_id=target_doc_id,
+            relationship_type="contradiction_detected",
+            explanation=explanation,
+            evidence_summary=evidence_summary,
+            confidence=confidence,
+        )
 
     # -------------------------------------------------------------------------
     # 4. Repository Querying, Filtering & Cascade Deletion (DOC-09, PR-014..PR-018)

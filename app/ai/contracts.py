@@ -268,8 +268,31 @@ class QuizAssessmentPayload(BaseModel):
     questions: List[QuizQuestionSchema]
 
 
+class GraphAutoLinkItem(BaseModel):
+    source_doc_id: str
+    target_doc_id: str
+    relationship_type: Literal[
+        "shared_topics",
+        "shared_entities",
+        "semantic_similarity",
+        "explicit_reference",
+        "shared_metric_lineage",
+        "contradiction_detected",
+        "composite_related",
+    ] = "composite_related"
+    confidence: float = Field(default=0.78, ge=0.45, le=0.99)
+    explanation: str = Field(
+        description="Concise human-readable reason citing specific shared themes, schedules, entities, or metrics in both documents."
+    )
+
+
+class GraphAutoLinkPlan(BaseModel):
+    summary: str = Field(description="High-level summary of discovered workspace connections")
+    links: List[GraphAutoLinkItem] = Field(default_factory=list)
+
+
 class DialogueSegmentSchema(BaseModel):
-    speaker: Literal["Host (Budi)", "Expert (Siti)"]
+    speaker: Literal["Alex", "Sarah", "Host (Budi)", "Expert (Siti)"]
     text: str
     source_chunk_id: Optional[str] = None
 

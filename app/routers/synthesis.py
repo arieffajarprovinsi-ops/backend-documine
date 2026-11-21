@@ -1,6 +1,7 @@
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from app.core.workspace import WorkspaceContext, get_verified_workspace_context
 from app.db.supabase_client import supabase_db
 from app.ai.contracts import (
@@ -10,10 +11,61 @@ from app.ai.contracts import (
     ContradictionAlertItem,
 )
 from app.ai.gateway import ai_gateway, format_untrusted_chunk
-from app.services.retrieval_service import retrieval_service, citation_resolver
+from app.services.retrieval_service import citation_resolver
 from app.models.schemas import ChatCitation
 
 router = APIRouter(prefix="/synthesis", tags=["synthesis"])
+
+_CITE_TAG_RE = re.compile(r"\[cite:([a-zA-Z0-9_-]+)\]")
+_SYNTH_STOPWORDS = {
+    "yang", "dan", "atau", "dari", "untuk", "dengan", "pada", "dalam", "ini", "itu",
+    "oleh", "sebagai", "adalah", "akan", "telah", "dapat", "juga", "tahun", "ajaran",
+    "the", "and", "for", "with", "from", "that", "this", "are", "was", "have",
+    "dokumen", "document", "peserta", "kegiatan", "secara", "memuat", "merupakan",
+}
+
+
+def _clean_excerpt(text: str, max_chars: int = 280) -> str:
+    """Truncate cleanly on a sentence or word boundary instead of mid-word."""
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized or len(normalized) <= max_chars:
+        return normalized
+    window = normalized[:max_chars]
+    # Prefer ending cleanly at a sentence period if near the end
+    last_period = window.rfind(". ")
+    if last_period >= int(max_chars * 0.55):
+        return window[: last_period + 1].strip()
+    last_space = window.rfind(" ")
+    if last_space > 24:
+        return window[:last_space].rstrip(",;:-") + "..."
+    return window.rstrip(",;:-") + "..."
+
+
+def _humanize_citations(text: str, chunks_by_id: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Replace raw `[cite:UUID]` tokens with clean readable inline citations `[DocTitle · p. X]`
+    so users never see raw database UUIDs in rendered synthesis prose or matrix cells.
+    """
+    if not text:
+        return ""
+
+    def _repl(match: re.Match[str]) -> str:
+        cid = match.group(1)
+        chunk = chunks_by_id.get(cid)
+        if not chunk:
+            return ""
+        title = str(chunk.get("doc_title") or "Document").strip()
+        short_title = title[:34] + ("..." if len(title) > 34 else "")
+        page = int(chunk.get("page_number") or 1)
+        return f"({short_title}, p. {page})"
+
+    cleaned = _CITE_TAG_RE.sub(_repl, text)
+    return re.sub(r"\s+([.,;:])", r"\1", re.sub(r" {2,}", " ", cleaned)).strip()
+
+
+def _extract_meaningful_terms(text: str) -> Set[str]:
+    words = re.findall(r"[A-Za-z0-9]{4,}", (text or "").lower())
+    return {w for w in words if w not in _SYNTH_STOPWORDS}
 
 
 class SynthesisItem(BaseModel):
@@ -55,30 +107,53 @@ def _deterministic_cross_doc_synthesis(
     docs: List[Dict[str, Any]],
     chunks_by_doc: Dict[str, List[Dict[str, Any]]],
     metrics_by_doc: Dict[str, List[Dict[str, Any]]],
+    focus_query: Optional[str] = None,
 ) -> CrossDocumentSynthesisResponse:
     """
-    Deterministic, zero-hallucination cross-document synthesis derived strictly
-    from the actual uploaded documents' summaries, topics, metrics, and chunks.
+    Rich evidence-grounded cross-document synthesis derived strictly
+    from actual summaries, chunk text, topics, dates, entities, and metrics.
     """
     doc_titles = [d.get("title", "Document") for d in docs]
-    headline = f"Cross-Document Comparative Synthesis: {' vs. '.join(doc_titles[:3])}"
+    headline = f"Cross-Document Synthesis: {' vs. '.join(doc_titles[:3])}"
 
-    # 1. Compare Primary Domains & Executive Scope
     scope_findings: Dict[str, str] = {}
     summary_parts: List[str] = []
+    doc_terms: List[Set[str]] = []
+    time_findings: Dict[str, str] = {}
+
     for d in docs:
         did = str(d["id"])
+        d_title = d.get("title", "Document")
         d_chunks = chunks_by_doc.get(did, [])
         first_cid = str(d_chunks[0]["id"]) if d_chunks else ""
         cite_tag = f" [cite:{first_cid}]" if first_cid else ""
-        summary_snip = (d.get("summary") or "Document analyzed in workspace.").strip()
-        scope_findings[did] = f"{summary_snip[:220]}{cite_tag}"
-        summary_parts.append(f"**{d.get('title', did)}**: {summary_snip[:180]}{cite_tag}")
 
-    # 2. Topic Overlap & Divergence
+        chunk_blob = " ".join(
+            (c.get("text_content") or c.get("content") or "").strip()
+            for c in d_chunks[:4]
+        )
+        raw_summary = (d.get("summary") or "").strip()
+        snippet_source = raw_summary or _clean_excerpt(chunk_blob, 260) or "Indexed workspace document."
+        clean_scope = _clean_excerpt(snippet_source, 260)
+        scope_findings[did] = f"{clean_scope}{cite_tag}"
+        summary_parts.append(f"**{d_title}**: {_clean_excerpt(snippet_source, 220)}{cite_tag}")
+
+        combined_text = f"{d_title} {raw_summary} {' '.join(d.get('main_topics') or [])} {chunk_blob}"
+        doc_terms.append(_extract_meaningful_terms(combined_text))
+
+        # Extract concrete schedule / time / year / page telemetry from the actual document
+        dates_or_years = sorted(set(re.findall(r"\b(?:20\d{2}(?:[-/]\d{2,4})?|\d{1,2}[:.]\d{2}\s*(?:WIB|WITA|WIT)?|\d+\s*(?:jam|hours?|menit|minutes?))\b", combined_text, re.IGNORECASE)))
+        pages = int(d.get("page_count") or 1)
+        tbl_count = int(d.get("table_count") or 0)
+        if dates_or_years:
+            time_findings[did] = f"Timeline/markers: {', '.join(dates_or_years[:5])} ({pages}p, {len(d_chunks)} chunks){cite_tag}"
+        else:
+            time_findings[did] = f"{pages} pages, {len(d_chunks)} indexed passages, {tbl_count} structured tables{cite_tag}"
+
     topic_sets = [set(t.lower() for t in (d.get("main_topics") or []) if t) for d in docs]
     common_topics = sorted(set.intersection(*topic_sets)) if topic_sets else []
     all_topics = sorted(set.union(*topic_sets)) if topic_sets else []
+    common_terms = sorted(set.intersection(*doc_terms)) if len(doc_terms) >= 2 else []
 
     topic_findings: Dict[str, str] = {}
     for d in docs:
@@ -87,30 +162,47 @@ def _deterministic_cross_doc_synthesis(
         first_cid = str(d_chunks[0]["id"]) if d_chunks else ""
         cite_tag = f" [cite:{first_cid}]" if first_cid else ""
         topics_list = d.get("main_topics") or [d.get("primary_domain") or d.get("category") or "general"]
-        topic_findings[did] = f"Focuses on {', '.join(topics_list[:5])}{cite_tag}"
+        topic_findings[did] = f"Key themes: {', '.join(topics_list[:5])}{cite_tag}"
+
+    overlap_note = (
+        f"Both files share institutional/thematic context around: {', '.join(common_terms[:6])}."
+        if common_terms
+        else (
+            f"Shared focus areas: {', '.join(common_topics[:5])}."
+            if common_topics
+            else "Each document addresses a distinct operational workflow (no identical topics detected)."
+        )
+    )
 
     comparison_rows: List[SynthesisComparisonRow] = [
         SynthesisComparisonRow(
-            dimension_name="Core Scope & Findings",
+            dimension_name="Executive Scope & Purpose",
             per_document_findings=scope_findings,
             consensus_or_divergence=(
-                "Documents address complementary aspects of the workspace domain."
-                if common_topics
-                else "Documents cover distinct analytical scopes and perspectives."
+                f"{overlap_note} {('Focused on: ' + focus_query) if focus_query else ''}".strip()
+            ),
+        ),
+        SynthesisComparisonRow(
+            dimension_name="Schedule, Period & Document Structure",
+            per_document_findings=time_findings,
+            consensus_or_divergence=(
+                f"Common timeline/context terms ({', '.join(common_terms[:4])}) align across the compared files."
+                if common_terms
+                else "Schedules, page depths, and structural layouts serve different operational purposes."
             ),
         ),
         SynthesisComparisonRow(
             dimension_name="Thematic & Conceptual Focus",
             per_document_findings=topic_findings,
             consensus_or_divergence=(
-                f"Shared thematic overlap on: {', '.join(common_topics[:5])}."
+                f"Shared topics: {', '.join(common_topics[:5])}."
                 if common_topics
-                else f"Distinct topic distributions across {', '.join(all_topics[:6]) or 'uploaded files'}."
+                else f"Complementary topic coverage spanning {', '.join(all_topics[:6]) or 'selected documents'}."
             ),
         ),
     ]
 
-    # 3. Quantitative Metrics Comparison & Contradiction Detection
+    # Quantitative Metrics Comparison & Contradiction Detection
     contradictions: List[ContradictionAlertItem] = []
     metric_findings: Dict[str, str] = {}
     for d in docs:
@@ -119,17 +211,17 @@ def _deterministic_cross_doc_synthesis(
         d_chunks = chunks_by_doc.get(did, [])
         fallback_cid = str(d_chunks[0]["id"]) if d_chunks else ""
         if d_metrics:
-            m = d_metrics[0]
-            mcid = str(m.get("source_chunk_id") or fallback_cid)
+            top_metrics = [
+                f"{m.get('metric_name')}: {m.get('numeric_value')} {m.get('unit_or_currency', '')}".strip()
+                for m in d_metrics[:3]
+            ]
+            mcid = str(d_metrics[0].get("source_chunk_id") or fallback_cid)
             cite_tag = f" [cite:{mcid}]" if mcid else ""
-            metric_findings[did] = (
-                f"{m.get('metric_name')}: {m.get('numeric_value')} {m.get('unit_or_currency', '')}{cite_tag}"
-            )
+            metric_findings[did] = f"{' · '.join(top_metrics)}{cite_tag}"
         else:
             cite_tag = f" [cite:{fallback_cid}]" if fallback_cid else ""
-            metric_findings[did] = f"Qualitative text passage ({len(d_chunks)} indexed chunks){cite_tag}"
+            metric_findings[did] = f"Narrative/procedural content ({len(d_chunks)} indexed passages, 0 extracted numeric KPIs){cite_tag}"
 
-    # Check if two documents report different values for the same metric name or unit
     if len(docs) >= 2:
         d0, d1 = docs[0], docs[1]
         id0, id1 = str(d0["id"]), str(d1["id"])
@@ -162,31 +254,50 @@ def _deterministic_cross_doc_synthesis(
             if contradictions:
                 break
 
+    has_any_metrics = any(bool(metrics_by_doc.get(str(d["id"]))) for d in docs)
     comparison_rows.append(
         SynthesisComparisonRow(
-            dimension_name="Quantitative Indicators & Evidence",
+            dimension_name="Quantitative Indicators & Metrics",
             per_document_findings=metric_findings,
             consensus_or_divergence=(
                 contradictions[0].explanation
                 if contradictions
-                else "Quantitative metrics across documents represent distinct measurements without direct contradiction."
+                else (
+                    "Extracted quantitative figures measure separate scopes without conflicting totals."
+                    if has_any_metrics
+                    else "Documents are primarily qualitative/procedural rather than numeric KPI sheets."
+                )
             ),
         )
     )
 
-    agreements = (
-        [f"Shared domain concepts: {', '.join(common_topics[:5])}"]
-        if common_topics
-        else ["Each document provides primary source evidence within the workspace corpus."]
-    )
+    agreements: List[str] = []
+    if common_terms:
+        agreements.append(f"Shared context & terminology: {', '.join(common_terms[:6])}")
+    if common_topics:
+        agreements.append(f"Shared topic tags: {', '.join(common_topics[:5])}")
+    if not agreements:
+        agreements.append(
+            f"Complementary coverage across {len(docs)} documents without overlapping duplicates."
+        )
+
     takeaways = [
-        f"Synthesized {len(docs)} workspace documents ({', '.join(doc_titles)}).",
-        f"Identified {len(common_topics)} shared topic areas and {len(contradictions)} quantitative variations.",
+        f"Compared {len(docs)} documents ({' vs. '.join(doc_titles[:3])}) across scope, timeline markers, themes, and quantitative metrics.",
+        (
+            f"Detected {len(common_terms)} overlapping context terms ({', '.join(common_terms[:5])})."
+            if common_terms
+            else "Each document documents an independent activity or specification."
+        ),
+        (
+            f"Flagged {len(contradictions)} metric variance(s) requiring review."
+            if contradictions
+            else "No factual contradictions or conflicting metrics were detected."
+        ),
     ]
 
     return CrossDocumentSynthesisResponse(
         synthesis_headline=headline,
-        executive_synthesis=" ".join(summary_parts),
+        executive_synthesis="\n\n".join(summary_parts),
         key_agreements=agreements,
         comparison_matrix=comparison_rows,
         contradiction_alerts=contradictions,
@@ -222,6 +333,7 @@ async def _execute_cross_doc_synthesis(
         all_candidate_chunks.extend(doc_chunks[:6])
         metrics_by_doc[doc_id] = supabase_db.get_workspace_metrics(ctx.workspace_id, doc_ids=[doc_id])
 
+    chunks_by_id = {str(c["id"]): c for c in all_candidate_chunks if c.get("id")}
     synthesis_result: Optional[CrossDocumentSynthesisResponse] = None
 
     if ai_gateway.is_openai_configured and all_candidate_chunks:
@@ -242,7 +354,7 @@ async def _execute_cross_doc_synthesis(
             )
             prompt_input = (
                 f"Documents to Compare:\n{doc_overview}\n\n"
-                f"Focus Query: {request.focus_query or 'Comprehensive comparative synthesis and contradiction audit'}\n\n"
+                f"Focus Query: {request.focus_query or 'Comprehensive comparative synthesis, overlap audit, and actionable takeaways'}\n\n"
                 f"Evidence Passages:\n{passages}"
             )
             synthesis_result = await ai_gateway.generate_structured(
@@ -251,8 +363,10 @@ async def _execute_cross_doc_synthesis(
                 user_id=ctx.user_id,
                 instructions=(
                     "You are the DocuMind Cross-Document Synthesis Engine. Compare the provided documents strictly "
-                    "using the <untrusted_document_chunk> passages. Every claim in executive_synthesis and "
-                    "per_document_findings MUST include [cite:CHUNK_ID]. Flag any factual or quantitative contradictions."
+                    "using the <untrusted_document_chunk> passages. Write clear, complete, insightful sentences (never cut mid-word). "
+                    "Include [cite:CHUNK_ID] citations naturally after concrete claims, compare 4 distinct dimensions "
+                    "(Executive Scope, Key Schedules & Requirements, Shared Context & Concepts, Quantitative / Risk Differences), "
+                    "and list concrete agreements, emergent takeaways, and any contradictions."
                 ),
                 input_blocks=prompt_input,
                 response_model=CrossDocumentSynthesisResponse,
@@ -262,9 +376,10 @@ async def _execute_cross_doc_synthesis(
             print(f"[SynthesisRouter] OpenAI synthesis notice, using deterministic synthesis: {e}")
 
     if synthesis_result is None:
-        synthesis_result = _deterministic_cross_doc_synthesis(docs, chunks_by_doc, metrics_by_doc)
+        synthesis_result = _deterministic_cross_doc_synthesis(
+            docs, chunks_by_doc, metrics_by_doc, focus_query=request.focus_query
+        )
 
-    # Persist any discovered contradictions as relationship edges in public.document_relationships
     for alert in synthesis_result.contradiction_alerts:
         if alert.doc_a_id and alert.doc_b_id and alert.doc_a_id != alert.doc_b_id:
             supabase_db.save_contradiction_relationship(
@@ -275,7 +390,6 @@ async def _execute_cross_doc_synthesis(
                 evidence_summary=alert.model_dump(),
             )
 
-    # Resolve [cite:CHUNK_ID] citations across the executive synthesis and matrix findings
     combined_citation_text = synthesis_result.executive_synthesis
     for row in synthesis_result.comparison_matrix:
         for finding in row.per_document_findings.values():
@@ -286,13 +400,28 @@ async def _execute_cross_doc_synthesis(
         candidate_chunks=all_candidate_chunks,
     )
 
-    # Build backward-compatible `matrix` items alongside `comparison_matrix`
+    # Humanize all `[cite:UUID]` tokens across rendered fields so raw UUIDs never appear
+    clean_exec = _humanize_citations(synthesis_result.executive_synthesis, chunks_by_id)
+    cleaned_rows: List[SynthesisComparisonRow] = []
+    for row in synthesis_result.comparison_matrix:
+        cleaned_findings = {
+            k: _humanize_citations(v, chunks_by_id)
+            for k, v in row.per_document_findings.items()
+        }
+        cleaned_rows.append(
+            SynthesisComparisonRow(
+                dimension_name=row.dimension_name,
+                per_document_findings=cleaned_findings,
+                consensus_or_divergence=_humanize_citations(row.consensus_or_divergence, chunks_by_id),
+            )
+        )
+
     doc_a_id = str(docs[0]["id"])
     doc_b_id = str(docs[1]["id"])
     contradiction_topics = {c.topic_or_metric.lower() for c in synthesis_result.contradiction_alerts}
 
     legacy_matrix: List[SynthesisItem] = []
-    for row in synthesis_result.comparison_matrix:
+    for row in cleaned_rows:
         is_contra = (
             row.dimension_name.lower() in contradiction_topics
             or "contradict" in row.consensus_or_divergence.lower()
@@ -313,13 +442,13 @@ async def _execute_cross_doc_synthesis(
         title=synthesis_result.synthesis_headline,
         synthesis_headline=synthesis_result.synthesis_headline,
         document_ids=request.document_ids,
-        executive_summary=synthesis_result.executive_synthesis,
-        executive_synthesis=synthesis_result.executive_synthesis,
-        key_agreements=synthesis_result.key_agreements,
+        executive_summary=clean_exec,
+        executive_synthesis=clean_exec,
+        key_agreements=[_humanize_citations(a, chunks_by_id) for a in synthesis_result.key_agreements],
         matrix=legacy_matrix,
-        comparison_matrix=synthesis_result.comparison_matrix,
+        comparison_matrix=cleaned_rows,
         contradiction_alerts=synthesis_result.contradiction_alerts,
-        emergent_takeaways=synthesis_result.emergent_takeaways,
+        emergent_takeaways=[_humanize_citations(t, chunks_by_id) for t in synthesis_result.emergent_takeaways],
         citations=resolved_citations,
     )
 
@@ -331,7 +460,6 @@ async def compare_workspace_documents(
 ):
     """
     Stage 5 Cross-Document Synthesis & Contradiction Detection (DOC-16, PR-031, PR-032).
-    Compares 2 to 10 workspace documents over their actual extracted chunks, summaries, and metrics.
     """
     return await _execute_cross_doc_synthesis(request, ctx)
 

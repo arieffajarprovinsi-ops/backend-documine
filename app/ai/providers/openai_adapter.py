@@ -50,6 +50,13 @@ OPENAI_PRICING_PER_1M: Dict[str, Dict[str, float]] = {
         "input_auto": 0.02,
         "input_flex": 0.01,
     },
+    "gpt-4o-mini-tts": {
+        "input_auto": 0.60,
+        "output_auto": 12.00,
+    },
+    "tts-1": {
+        "input_auto": 15.00,
+    },
 }
 
 
@@ -371,3 +378,68 @@ class OpenAIProviderAdapter:
             "estimated_cost_usd": cost_usd,
             "latency_ms": latency_ms,
         }
+
+    async def generate_speech_bytes(
+        self,
+        *,
+        text: str,
+        voice: str = "alloy",
+        model: str = "gpt-4o-mini-tts",
+        instructions: Optional[str] = None,
+    ) -> tuple[bytes, Dict[str, Any]]:
+        if not self.is_configured:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+
+        clean_text = (text or "").strip()[:1200]
+        if not clean_text:
+            raise ValueError("Speech input text is empty.")
+
+        t0 = time.perf_counter()
+        attempts = [model]
+        if model != "tts-1":
+            attempts.append("tts-1")
+
+        last_err: Optional[Exception] = None
+        for idx, m_name in enumerate(attempts):
+            try:
+                kwargs: Dict[str, Any] = {
+                    "model": m_name,
+                    "voice": voice,
+                    "input": clean_text,
+                    "response_format": "mp3",
+                }
+                if instructions and m_name == "gpt-4o-mini-tts":
+                    kwargs["instructions"] = instructions
+                speech_res = await self._get_client().audio.speech.create(**kwargs)
+                if hasattr(speech_res, "aread"):
+                    audio_bytes = await speech_res.aread()
+                elif hasattr(speech_res, "read"):
+                    audio_bytes = speech_res.read()
+                else:
+                    audio_bytes = bytes(getattr(speech_res, "content", b""))
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                est_tokens = max(1, len(clean_text) // 4)
+                est_audio_tokens = max(10, int(len(audio_bytes) / 160))
+                if m_name == "tts-1":
+                    cost_usd = round((len(clean_text) / 1_000_000.0) * 15.0, 6)
+                else:
+                    cost_usd = round(
+                        (est_tokens * 0.60 + est_audio_tokens * 12.0) / 1_000_000.0,
+                        6,
+                    )
+                return audio_bytes, {
+                    "provider": self.provider_name,
+                    "model": m_name,
+                    "service_tier": "auto",
+                    "input_tokens": est_tokens,
+                    "cached_tokens": 0,
+                    "output_tokens": est_audio_tokens,
+                    "reasoning_tokens": 0,
+                    "estimated_cost_usd": cost_usd,
+                    "latency_ms": latency_ms,
+                }
+            except Exception as exc:
+                last_err = exc
+                if idx >= len(attempts) - 1:
+                    raise
+        raise last_err or RuntimeError("Speech generation failed.")

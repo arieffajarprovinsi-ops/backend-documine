@@ -341,5 +341,34 @@ class AIGateway:
         )
         return vectors
 
+    async def generate_speech(
+        self,
+        *,
+        text: str,
+        workspace_id: str,
+        user_id: Optional[str] = None,
+        voice: str = "alloy",
+        instructions: Optional[str] = None,
+    ) -> tuple[bytes, Dict[str, Any]]:
+        self._enforce_workspace_budget(workspace_id)
+        adapter = self._llm_providers.get("openai")
+        if not isinstance(adapter, OpenAIProviderAdapter) or not adapter.is_configured:
+            raise RuntimeError("OpenAI TTS is not configured.")
+
+        model_name = (getattr(settings, "openai_tts_model", "gpt-4o-mini-tts") or "gpt-4o-mini-tts").strip()
+        audio_bytes, usage_meta = await adapter.generate_speech_bytes(
+            text=text,
+            voice=voice,
+            model=model_name,
+            instructions=instructions,
+        )
+        self._record_telemetry(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            task_type=AITaskType.AUDIO_BRIEFING_SCRIPT,
+            usage_meta=usage_meta,
+        )
+        return audio_bytes, usage_meta
+
 
 ai_gateway = AIGateway()
