@@ -1,0 +1,29 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+
+# Python Virtual Environments & Caches
+venv/
+.venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local Uploads & Runtime Artifacts
+uploads/
+*.duckdb
+*.duckdb.wal
+*.sqlite3
+*.log
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

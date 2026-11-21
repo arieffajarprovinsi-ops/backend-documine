@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+!.env.example
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+uploads
+*.duckdb
+*.duckdb.wal
+*.sqlite3
