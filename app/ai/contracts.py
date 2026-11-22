@@ -304,3 +304,22 @@ class AudioBriefingScriptPayload(BaseModel):
     title: str
     duration_estimate_seconds: int = 90
     dialogue: List[DialogueSegmentSchema]
+
+
+class ChatIntentRoute(BaseModel):
+    intent: Literal["small_talk", "document_qa", "workspace_overview"] = Field(
+        default="document_qa",
+        description=(
+            "Use 'small_talk' for greetings, casual chitchat, thank-yous, acknowledgements, or questions about the "
+            "assistant itself (e.g. 'halo bang', 'selamat pagi', 'thanks', 'ok', 'siapa kamu'). Use 'workspace_overview' "
+            "for broad document summaries/takeaways. Use 'document_qa' for specific factual questions about documents."
+        ),
+    )
+    language: Literal["id", "en", "mixed"] = Field(
+        default="id",
+        description="Dominant language of the user's message ('id' for Indonesian, 'en' for English, 'mixed' for mixed).",
+    )
+    needs_document_search: bool = Field(
+        default=True,
+        description="False when intent is 'small_talk'; True when the system needs to read or search uploaded documents.",
+    )

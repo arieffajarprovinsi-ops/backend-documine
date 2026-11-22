@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from app.ai.contracts import AITaskType, QuizAssessmentPayload
+from app.ai.contracts import AITaskType, ChatIntentRoute, QuizAssessmentPayload
 from app.core.hardening import sanitize_client_error
 from app.ai.gateway import ai_gateway, format_untrusted_chunk
 from app.core.workspace import WorkspaceContext, get_verified_workspace_context
@@ -41,6 +41,200 @@ ASSISTANT_GENERAL_INSTRUCTIONS = """You are the DocuMind Document Intelligence A
 The user currently has no uploaded documents in their workspace yet.
 Answer their question helpfully, concisely, and clearly in the same language they used (Indonesian or English), using clean Markdown (headings, bullet lists, or tables where helpful).
 Never invent fake document citations or claim you read files that were not uploaded. If their question asks about a private file, briefly remind them they can upload a PDF, CSV, or TXT using the '+' button in the chat box to enable grounded document Q&A with page citations."""
+
+ASSISTANT_SMALL_TALK_INSTRUCTIONS = """You are the DocuMind Workspace AI Assistant.
+The user sent a conversational greeting, acknowledgement, casual remark, or general assistant question (small talk) rather than asking for specific facts from a document.
+RULES:
+1. Reply naturally, warmly, and concisely in the EXACT language and tone the user used (Indonesian if they wrote Indonesian like 'halo bang' / 'selamat pagi', or English if they wrote English).
+2. Do NOT run any retrieval error message and do NOT claim you couldn't find passages in their PDFs.
+3. If helpful, briefly mention the uploaded file name(s) available in <workspace_files> and ask which document or topic they want to summarize or analyze.
+4. NEVER invent factual claims about the contents inside any document."""
+
+
+def _detect_user_language(text: str) -> str:
+    low = (text or "").strip().lower()
+    if not low:
+        return "en"
+    id_markers = (
+        "halo", "hai", "pagi", "siang", "sore", "malam", "bang", "mas", "kak", "bro",
+        "terima kasih", "makasih", "tolong", "bantu", "ringkas", "rangkum", "jelaskan",
+        "apa", "siapa", "kapan", "dimana", "bagaimana", "gimana", "berapa", "kenapa",
+        "dokumen", "laporan", "file ini", "bisa", "tidak", "ga", "gak", "yg", "yang",
+        "untuk", "dengan", "dari", "ya", "oke", "siap", "mantap", "assalamualaikum",
+    )
+    en_markers = (
+        "hello", "hi ", "good morning", "what ", "summarize", "explain", "please",
+        "thank", "how ", "why ", "which ", "compare", "document", "takeaways",
+    )
+    id_hits = sum(1 for m in id_markers if m in low)
+    en_hits = sum(1 for m in en_markers if m in low)
+    if id_hits > en_hits:
+        return "id"
+    if en_hits > id_hits:
+        return "en"
+    return "id" if re.search(r"\b(yg|ga|gak|aja|nih|dong|sih|nya|bang|kak|pagi|makasih)\b", low) else "en"
+
+
+_INSTANT_SMALL_TALK_RE = re.compile(
+    r"^\s*(?:"
+    r"p+|tes+|test(?:ing)?|halo+(?:\s+(?:bang|bro|mas|mbak|kak|min|admin|ai|bot|documind))?|"
+    r"hai+(?:\s+(?:bang|bro|mas|kak|ai))?|hi+|hey+|hello+|yo+|"
+    r"(?:selamat\s+)?(?:pagi|siang|sore|malam)|good\s+(?:morning|afternoon|evening|night)|"
+    r"ass?alam(?:u'?alaikum)?|wa'?alaikum(?:salam)?|"
+    r"(?:apa\s+kabar|kabarnya|how\s+are\s+you)|"
+    r"(?:terima\s+kasih|makasih|thanks?(?:\s+you)?|thx|ty)|"
+    r"(?:ok(?:e|ay)?|siap+|mantap+|sip+|baik+|noted|cool|nice|great|awesome)|"
+    r"(?:siapa\s+(?:kamu|anda|lu)|kamu\s+bisa\s+apa|who\s+are\s+you|what\s+can\s+you\s+do)"
+    r")[\s!?.~,]*$",
+    re.IGNORECASE,
+)
+
+_DOC_WORK_HINT_RE = re.compile(
+    r"\b(pdf|csv|xlsx|dokumen|document|file|halaman|page|tabel|table|angka|total|biaya|laporan|"
+    r"summary|summarize|ringkas\w*|rangkum\w*|jelaskan|analisis|analisa|compare|banding\w*|berapa|"
+    r"kesimpulan|takeaway|ekstrak|extract)\b",
+    re.IGNORECASE,
+)
+
+
+async def _classify_chat_intent(
+    *,
+    workspace_id: str,
+    user_id: Optional[str],
+    user_message: str,
+    has_docs: bool,
+) -> ChatIntentRoute:
+    """
+    Decide whether the prompt is conversational small talk (skip heavy document search)
+    or requires reading/searching workspace documents, and detect user language.
+    """
+    clean = (user_message or "").strip()
+    lang_guess = _detect_user_language(clean)
+
+    if _INSTANT_SMALL_TALK_RE.match(clean):
+        return ChatIntentRoute(
+            intent="small_talk",
+            language=lang_guess if lang_guess in ("id", "en") else "id",
+            needs_document_search=False,
+        )
+
+    words = clean.split()
+    if _BROAD_OVERVIEW_PATTERN.search(clean):
+        return ChatIntentRoute(
+            intent="workspace_overview",
+            language=lang_guess if lang_guess in ("id", "en") else "id",
+            needs_document_search=has_docs,
+        )
+
+    # Let the fast AI router decide on short / ambiguous conversational turns without clear doc keywords
+    if ai_gateway.is_openai_configured and len(words) <= 12 and not _DOC_WORK_HINT_RE.search(clean):
+        try:
+            route = await ai_gateway.generate_structured(
+                task_type=AITaskType.QUERY_REWRITE_AND_ROUTING,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                instructions=(
+                    "Classify the user's message for a document Q&A assistant. "
+                    "Set intent='small_talk' and needs_document_search=false ONLY for greetings, casual chitchat, "
+                    "acknowledgements, gratitude, or general questions about the bot itself. "
+                    "Set intent='workspace_overview' and needs_document_search=true for requests to summarize/overview "
+                    "uploaded files. Set intent='document_qa' and needs_document_search=true for questions asking facts, "
+                    "analysis, or specific content."
+                ),
+                input_blocks=clean,
+                response_model=ChatIntentRoute,
+                scope_key=f"intent:{lang_guess}",
+            )
+            return route
+        except Exception as exc:
+            logger.debug("Chat intent AI classification fallback: %s", exc)
+
+    return ChatIntentRoute(
+        intent="document_qa",
+        language=lang_guess if lang_guess in ("id", "en") else "id",
+        needs_document_search=has_docs,
+    )
+
+
+def _build_small_talk_prompt(
+    *,
+    docs_meta: List[Dict[str, Any]],
+    conversation_history: List[Dict[str, str]],
+    user_message: str,
+    language: str,
+) -> str:
+    titles = [f'"{d.get("title") or "Untitled"}"' for d in docs_meta[:5]]
+    files_block = (
+        "<workspace_files>\n"
+        + (f"Scoped files ({len(docs_meta)}): " + ", ".join(titles) if titles else "No files selected.")
+        + "\n</workspace_files>"
+    )
+    history_lines: List[str] = []
+    if conversation_history:
+        history_lines.append("<conversation_history>")
+        for turn in conversation_history[-6:]:
+            role = turn.get("role", "user")
+            content = turn.get("content", "")
+            history_lines.append(f"{role.upper()}: {content}")
+        history_lines.append("</conversation_history>")
+    return "\n\n".join(
+        part
+        for part in [
+            files_block,
+            "\n".join(history_lines) if history_lines else "",
+            f"DETECTED_USER_LANGUAGE: {language}\nUSER MESSAGE: {user_message}",
+        ]
+        if part
+    )
+
+
+def _deterministic_small_talk_reply(
+    user_message: str,
+    docs_meta: List[Dict[str, Any]],
+    language: str,
+) -> str:
+    low = (user_message or "").lower()
+    doc_names = ", ".join(f'"{d.get("title")}"' for d in docs_meta[:2])
+    if language == "id":
+        if any(w in low for w in ("makasih", "terima kasih", "thanks", "thx")):
+            return "Sama-sama! Kalau ada dokumen lain yang ingin diringkas atau dicek datanya, langsung beri tahu saja."
+        if any(w in low for w in ("pagi", "siang", "sore", "malam", "halo", "hai", "assalam")):
+            if doc_names:
+                return f"Halo! Ada yang bisa saya bantu? Dokumen {doc_names} sudah siap — mau saya ringkas, jelaskan poin pentingnya, atau cari data tertentu?"
+            return "Halo! Ada yang bisa saya bantu dengan dokumen di workspace Anda hari ini?"
+        if doc_names:
+            return f"Siap! Beri tahu saja apa yang ingin Anda tanyakan atau analisis dari {doc_names}."
+        return "Siap! Silakan tanyakan apa pun atau unggah dokumen untuk mulai analisis."
+
+    if any(w in low for w in ("thank", "thx")):
+        return "You're welcome! Let me know anytime you'd like to analyze or summarize another document."
+    if doc_names:
+        return f"Hello! How can I help you with {doc_names} today? Feel free to ask for a summary, key metrics, or specific details."
+    return "Hello! How can I help you explore your workspace documents today?"
+
+
+def _localized_followups(has_docs: bool, language: str) -> List[str]:
+    if language == "id":
+        if has_docs:
+            return [
+                "Ringkas poin-poin utama dari dokumen ini",
+                "Buat tabel ringkasan temuan penting beserta halamannya",
+                "Apakah ada angka penting, catatan, atau risiko di file ini?",
+            ]
+        return [
+            "Format dokumen apa saja yang didukung DocuMind?",
+            "Bagaimana cara kerja sitasi halaman otomatis?",
+        ]
+    if has_docs:
+        return [
+            "What are the key quantitative findings in this document?",
+            "Create a summary table of key points with page references.",
+            "Are there any risks or anomalies mentioned?",
+        ]
+    return [
+        "Which document formats does DocuMind support?",
+        "How does automatic page citation work?",
+    ]
 
 
 def _build_general_prompt(
@@ -223,27 +417,46 @@ def _deterministic_grounded_fallback_answer(
     retrieved_chunks: List[Dict[str, Any]],
     retrieval_status: str,
     docs_meta: List[Dict[str, Any]],
+    language: str = "en",
 ) -> str:
     """
     Evidence-only deterministic synthesis used when OPENAI_API_KEY is not configured.
-    Never invents Carnot/R-134a text; strictly cites actual retrieved chunks or abstains honestly.
+    Strictly cites actual retrieved chunks or abstains honestly in the user's language.
     """
     if not retrieved_chunks or retrieval_status == "insufficient_evidence":
-        doc_titles = ", ".join(f'"{d.get("title")}"' for d in docs_meta[:3]) or "documents in your workspace"
+        doc_titles = ", ".join(f'"{d.get("title")}"' for d in docs_meta[:3]) or (
+            "dokumen di workspace Anda" if language == "id" else "documents in your workspace"
+        )
         summaries = [
             f'- **{d.get("title") or "Document"}**: {(d.get("summary") or "").strip()}'
             for d in docs_meta[:3]
             if (d.get("summary") or "").strip()
         ]
         if summaries and _is_broad_overview_query(user_message):
-            return "Document overview based on indexed metadata:\n" + "\n".join(summaries)
+            header = (
+                "Ringkasan dokumen berdasarkan metadata terindeks:\n"
+                if language == "id"
+                else "Document overview based on indexed metadata:\n"
+            )
+            return header + "\n".join(summaries)
+        if language == "id":
+            return (
+                f"Setelah memeriksa {doc_titles}, belum ditemukan potongan teks yang relevan untuk "
+                f'"{user_message}". Jika file berupa PDF hasil pindai gambar atau kosong tanpa teks, '
+                "coba unggah PDF berbasis teks atau lakukan re-index dokumen."
+            )
         return (
             f"After searching {doc_titles}, no extractable matching text passages were found for "
             f'"{user_message}". If the file is a scanned image PDF without an OCR text layer or is empty, '
             "try uploading a text-based PDF or re-indexing the document."
         )
 
-    lines = ["Based on the evidence found in your documents:"]
+    intro = (
+        "Berdasarkan bukti yang ditemukan dalam dokumen Anda:"
+        if language == "id"
+        else "Based on the evidence found in your documents:"
+    )
+    lines = [intro]
     for c in retrieved_chunks[:3]:
         cid = str(c.get("chunk_id") or c.get("id"))
         snippet = (c.get("text_content") or c.get("content") or "").strip()
@@ -279,35 +492,73 @@ async def chat_with_document(
     else:
         docs_meta = supabase_db.list_workspace_documents(ctx.workspace_id)
 
-    search_outcome = await retrieval_service.search_hybrid(
+    has_docs = len(docs_meta) > 0
+    intent_route = await _classify_chat_intent(
         workspace_id=ctx.workspace_id,
         user_id=ctx.user_id,
-        query=req.message,
-        doc_ids=target_doc_ids if target_doc_ids else None,
-        match_count=12 if len(target_doc_ids) > 1 else 8,
-    )
-    retrieved_chunks = search_outcome["results"]
-    retrieval_status = search_outcome["retrieval_status"]
-    retrieved_chunks, retrieval_status = await _backfill_scoped_evidence(
-        workspace_id=ctx.workspace_id,
         user_message=req.message,
-        docs_meta=docs_meta,
-        target_doc_ids=target_doc_ids,
-        retrieved_chunks=retrieved_chunks,
-        retrieval_status=retrieval_status,
+        has_docs=has_docs,
     )
+    is_small_talk = intent_route.intent == "small_talk" or not intent_route.needs_document_search
+
+    retrieved_chunks: List[Dict[str, Any]] = []
+    retrieval_status = "conversational" if is_small_talk else "insufficient_evidence"
+
+    if has_docs and not is_small_talk:
+        search_outcome = await retrieval_service.search_hybrid(
+            workspace_id=ctx.workspace_id,
+            user_id=ctx.user_id,
+            query=req.message,
+            doc_ids=target_doc_ids if target_doc_ids else None,
+            match_count=12 if len(target_doc_ids) > 1 else 8,
+        )
+        retrieved_chunks = search_outcome["results"]
+        retrieval_status = search_outcome["retrieval_status"]
+        retrieved_chunks, retrieval_status = await _backfill_scoped_evidence(
+            workspace_id=ctx.workspace_id,
+            user_message=req.message,
+            docs_meta=docs_meta,
+            target_doc_ids=target_doc_ids,
+            retrieved_chunks=retrieved_chunks,
+            retrieval_status=retrieval_status,
+        )
 
     # Choose task type based on complexity/scope (ADR-008)
     task_type = (
-        AITaskType.GROUNDED_CHAT_DEEP
-        if (req.deep_analysis or len(target_doc_ids) > 1)
-        else AITaskType.GROUNDED_CHAT_STANDARD
+        AITaskType.QUERY_REWRITE_AND_ROUTING
+        if is_small_talk
+        else (
+            AITaskType.GROUNDED_CHAT_DEEP
+            if (req.deep_analysis or len(target_doc_ids) > 1)
+            else AITaskType.GROUNDED_CHAT_STANDARD
+        )
     )
     route_policy = ai_gateway.get_route_policy(task_type)
 
-    if retrieval_status == "insufficient_evidence" and not retrieved_chunks:
+    if is_small_talk:
+        if ai_gateway.is_openai_configured:
+            sm_prompt = _build_small_talk_prompt(
+                docs_meta=docs_meta,
+                conversation_history=req.conversation_history,
+                user_message=req.message,
+                language=intent_route.language,
+            )
+            try:
+                raw_answer = await ai_gateway.generate_text(
+                    task_type=task_type,
+                    workspace_id=ctx.workspace_id,
+                    user_id=ctx.user_id,
+                    instructions=ASSISTANT_SMALL_TALK_INSTRUCTIONS,
+                    input_blocks=sm_prompt,
+                    scope_key="small_talk",
+                )
+            except Exception:
+                raw_answer = _deterministic_small_talk_reply(req.message, docs_meta, intent_route.language)
+        else:
+            raw_answer = _deterministic_small_talk_reply(req.message, docs_meta, intent_route.language)
+    elif retrieval_status == "insufficient_evidence" and not retrieved_chunks:
         raw_answer = _deterministic_grounded_fallback_answer(
-            req.message, retrieved_chunks, retrieval_status, docs_meta
+            req.message, retrieved_chunks, retrieval_status, docs_meta, intent_route.language
         )
     elif ai_gateway.is_openai_configured:
         prompt_input = _build_grounded_prompt(
@@ -328,19 +579,15 @@ async def chat_with_document(
             )
         except Exception:
             raw_answer = _deterministic_grounded_fallback_answer(
-                req.message, retrieved_chunks, retrieval_status, docs_meta
+                req.message, retrieved_chunks, retrieval_status, docs_meta, intent_route.language
             )
     else:
         raw_answer = _deterministic_grounded_fallback_answer(
-            req.message, retrieved_chunks, retrieval_status, docs_meta
+            req.message, retrieved_chunks, retrieval_status, docs_meta, intent_route.language
         )
 
     verified_answer, verified_citations = citation_resolver.resolve_citations(raw_answer, retrieved_chunks)
-    followups = [
-        "What are the key quantitative findings in this document?",
-        "Explain the methodology or key conclusions with page references.",
-        "Are there any limitations or risks mentioned in the document?",
-    ]
+    followups = _localized_followups(has_docs, intent_route.language)
 
     saved_turn = supabase_db.save_conversation_turn(
         workspace_id=ctx.workspace_id,
@@ -397,23 +644,32 @@ async def stream_chat_with_document(
         t_start = time.perf_counter()
         try:
             has_docs = len(docs_meta) > 0
+            intent_route = await _classify_chat_intent(
+                workspace_id=ctx.workspace_id,
+                user_id=ctx.user_id,
+                user_message=req.message,
+                has_docs=has_docs,
+            )
+            is_small_talk = intent_route.intent == "small_talk" or not intent_route.needs_document_search
+            should_search = has_docs and not is_small_talk
+
             initial_status = {
-                "stage": "searching" if has_docs else "reasoning",
-                "orbState": "searching" if has_docs else "reasoning",
-                "variant": "lighthouse" if has_docs else ("twins" if req.deep_analysis else "default"),
+                "stage": "searching" if should_search else "reasoning",
+                "orbState": "searching" if should_search else "reasoning",
+                "variant": "lighthouse" if should_search else ("twins" if req.deep_analysis else "default"),
                 "label": (
                     f"Searching evidence across {len(docs_meta)} documents..."
-                    if has_docs
-                    else ("Reasoning in depth..." if req.deep_analysis else "Processing request...")
+                    if should_search
+                    else ("Responding naturally..." if is_small_talk else "Processing request...")
                 ),
-                "docs_searched": len(docs_meta),
+                "docs_searched": len(docs_meta) if should_search else 0,
             }
             yield f"event: status\ndata: {json.dumps(initial_status)}\n\n"
 
             retrieved_chunks: List[Dict[str, Any]] = []
-            retrieval_status = "insufficient_evidence"
+            retrieval_status = "conversational" if is_small_talk else "insufficient_evidence"
 
-            if has_docs:
+            if should_search:
                 search_task = asyncio.create_task(
                     retrieval_service.search_hybrid(
                         workspace_id=ctx.workspace_id,
@@ -446,9 +702,13 @@ async def stream_chat_with_document(
                 )
 
             task_type = (
-                AITaskType.GROUNDED_CHAT_DEEP
-                if (req.deep_analysis or len(target_doc_ids) > 1)
-                else AITaskType.GROUNDED_CHAT_STANDARD
+                AITaskType.QUERY_REWRITE_AND_ROUTING
+                if is_small_talk
+                else (
+                    AITaskType.GROUNDED_CHAT_DEEP
+                    if (req.deep_analysis or len(target_doc_ids) > 1)
+                    else AITaskType.GROUNDED_CHAT_STANDARD
+                )
             )
             route_policy = ai_gateway.get_route_policy(task_type)
 
@@ -457,16 +717,20 @@ async def stream_chat_with_document(
                 "orbState": "reasoning" if req.deep_analysis else "working",
                 "variant": "twins" if req.deep_analysis else "gyro",
                 "label": (
-                    "Reasoning in depth (Deep Thinking)..."
-                    if req.deep_analysis
+                    "Writing conversational reply..."
+                    if is_small_talk
                     else (
-                        f"Composing answer from {len(retrieved_chunks)} citations..."
-                        if retrieved_chunks
-                        else "Writing response..."
+                        "Reasoning in depth (Deep Thinking)..."
+                        if req.deep_analysis
+                        else (
+                            f"Composing answer from {len(retrieved_chunks)} citations..."
+                            if retrieved_chunks
+                            else "Writing response..."
+                        )
                     )
                 ),
                 "chunks_found": len(retrieved_chunks),
-                "docs_searched": len(docs_meta),
+                "docs_searched": len(docs_meta) if should_search else 0,
                 "retrieval_status": retrieval_status,
                 "model": route_policy.primary_model,
             }
@@ -474,7 +738,58 @@ async def stream_chat_with_document(
 
             accumulated: List[str] = []
 
-            if not has_docs:
+            if is_small_talk:
+                if ai_gateway.is_openai_configured:
+                    sm_prompt = _build_small_talk_prompt(
+                        docs_meta=docs_meta,
+                        conversation_history=req.conversation_history,
+                        user_message=req.message,
+                        language=intent_route.language,
+                    )
+                    try:
+                        aiter = ai_gateway.stream_text(
+                            task_type=task_type,
+                            workspace_id=ctx.workspace_id,
+                            user_id=ctx.user_id,
+                            instructions=ASSISTANT_SMALL_TALK_INSTRUCTIONS,
+                            input_blocks=sm_prompt,
+                            scope_key="small_talk",
+                        ).__aiter__()
+                        while True:
+                            tok_task = asyncio.create_task(aiter.__anext__())
+                            waited = 0.0
+                            while not tok_task.done():
+                                done_set, _ = await asyncio.wait({tok_task}, timeout=8.0)
+                                if done_set:
+                                    break
+                                waited += 8.0
+                                if waited >= 32.0:
+                                    tok_task.cancel()
+                                    raise TimeoutError("AI stream stalled waiting for token.")
+                                yield ": keepalive\n\n"
+                            try:
+                                delta = await tok_task
+                            except StopAsyncIteration:
+                                break
+                            accumulated.append(delta)
+                            yield f"event: token_delta\ndata: {json.dumps({'delta': delta})}\n\n"
+                    except Exception as exc:
+                        logger.warning("Small-talk AI stream failed, using natural greeting fallback: %s", exc)
+                        if not accumulated:
+                            fallback_text = _deterministic_small_talk_reply(
+                                req.message, docs_meta, intent_route.language
+                            )
+                            async for part in _stream_text_chunks(fallback_text):
+                                accumulated.append(part)
+                                yield f"event: token_delta\ndata: {json.dumps({'delta': part})}\n\n"
+                else:
+                    fallback_text = _deterministic_small_talk_reply(
+                        req.message, docs_meta, intent_route.language
+                    )
+                    async for part in _stream_text_chunks(fallback_text):
+                        accumulated.append(part)
+                        yield f"event: token_delta\ndata: {json.dumps({'delta': part})}\n\n"
+            elif not has_docs:
                 if ai_gateway.is_openai_configured:
                     prompt_input = _build_general_prompt(
                         conversation_history=req.conversation_history,
@@ -532,7 +847,7 @@ async def stream_chat_with_document(
                         yield f"event: token_delta\ndata: {json.dumps({'delta': part})}\n\n"
             elif retrieval_status == "insufficient_evidence" and not retrieved_chunks:
                 fallback_text = _deterministic_grounded_fallback_answer(
-                    req.message, retrieved_chunks, retrieval_status, docs_meta
+                    req.message, retrieved_chunks, retrieval_status, docs_meta, intent_route.language
                 )
                 async for part in _stream_text_chunks(fallback_text):
                     accumulated.append(part)
@@ -576,21 +891,21 @@ async def stream_chat_with_document(
                     logger.warning("Grounded AI stream failed, using deterministic citation fallback: %s", exc)
                     if not accumulated:
                         fallback_text = _deterministic_grounded_fallback_answer(
-                            req.message, retrieved_chunks, retrieval_status, docs_meta
+                            req.message, retrieved_chunks, retrieval_status, docs_meta, intent_route.language
                         )
                         async for part in _stream_text_chunks(fallback_text):
                             accumulated.append(part)
                             yield f"event: token_delta\ndata: {json.dumps({'delta': part})}\n\n"
             else:
                 fallback_text = _deterministic_grounded_fallback_answer(
-                    req.message, retrieved_chunks, retrieval_status, docs_meta
+                    req.message, retrieved_chunks, retrieval_status, docs_meta, intent_route.language
                 )
                 async for part in _stream_text_chunks(fallback_text):
                     accumulated.append(part)
                     yield f"event: token_delta\ndata: {json.dumps({'delta': part})}\n\n"
 
             full_answer = "".join(accumulated)
-            if has_docs and retrieved_chunks:
+            if should_search and retrieved_chunks:
                 verify_status = {
                     "stage": "verifying",
                     "orbState": "compacting",
@@ -606,18 +921,7 @@ async def stream_chat_with_document(
             verified_answer, verified_citations = citation_resolver.resolve_citations(
                 full_answer, retrieved_chunks
             )
-            followups = (
-                [
-                    "What are the key quantitative findings in this document?",
-                    "Create a summary table of key points with page references.",
-                    "Are there any risks or anomalies mentioned?",
-                ]
-                if has_docs
-                else [
-                    "Which document formats does DocuMind support?",
-                    "How does automatic page citation work?",
-                ]
-            )
+            followups = _localized_followups(has_docs, intent_route.language)
             saved_turn = await asyncio.to_thread(
                 supabase_db.save_conversation_turn,
                 workspace_id=ctx.workspace_id,
@@ -638,11 +942,15 @@ async def stream_chat_with_document(
                 "message_id": saved_turn["message_id"],
                 "answer": verified_answer,
                 "model_used": route_policy.primary_model,
-                "retrieval_status": retrieval_status if has_docs else "overview_fallback",
+                "retrieval_status": (
+                    "conversational"
+                    if is_small_talk
+                    else (retrieval_status if has_docs else "overview_fallback")
+                ),
                 "citations": [c.model_dump() for c in verified_citations],
                 "suggested_followups": followups,
                 "chunks_found": len(retrieved_chunks),
-                "docs_searched": len(docs_meta),
+                "docs_searched": len(docs_meta) if should_search else 0,
                 "elapsed_ms": elapsed_ms,
             }
             yield f"event: citations_verified\ndata: {json.dumps(verified_payload)}\n\n"
