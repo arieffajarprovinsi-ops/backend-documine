@@ -128,7 +128,10 @@ class ExtractedTableColumnSchema(BaseModel):
 class ExtractedTableSchema(BaseModel):
     table_title: str
     columns: List[ExtractedTableColumnSchema]
-    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    rows: List[List[str]] = Field(
+        default_factory=list,
+        description="Table rows as ordered string arrays aligning 1:1 with columns.",
+    )
 
 
 class OCRPageExtraction(BaseModel):

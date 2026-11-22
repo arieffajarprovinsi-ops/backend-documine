@@ -304,9 +304,73 @@ class DocumentIngestionService:
                                         ),
                                     }
                                 )
+                        for desc in ocr_res.visual_chart_descriptions:
+                            if (desc or "").strip():
+                                page_blocks.setdefault(p_num, []).append(
+                                    {
+                                        "text": f"[Visual / Diagram Description - Page {p_num}]: {desc.strip()}",
+                                        "word_count": len(desc.split()),
+                                        "bbox": BoundingBox(left=0.06, top=0.08, width=0.88, height=0.84, page_number=p_num),
+                                    }
+                                )
+                        for tbl in ocr_res.extracted_tables:
+                            col_names = [c.name for c in tbl.columns]
+                            row_lines = [" | ".join(r) for r in tbl.rows if r]
+                            tbl_text = f"Table: {tbl.table_title}\nColumns: {' | '.join(col_names)}\n" + "\n".join(row_lines)
+                            if tbl_text.strip():
+                                page_blocks.setdefault(p_num, []).append(
+                                    {
+                                        "text": tbl_text.strip(),
+                                        "word_count": len(tbl_text.split()),
+                                        "bbox": BoundingBox(left=0.06, top=0.1, width=0.88, height=0.8, page_number=p_num),
+                                    }
+                                )
                     except Exception as ocr_err:
-                        print(f"[IngestionService] Vision OCR warning on page {p_num}: {ocr_err}")
-                        partial_ocr_failures += 1
+                        print(f"[IngestionService] Vision OCR structured warning on page {p_num}: {ocr_err}")
+                        # Fallback to plain-text Vision transcription if structured schema parse failed
+                        try:
+                            plain_ocr = await ai_gateway.generate_text(
+                                task_type=AITaskType.VISION_OCR_AND_TABLES,
+                                workspace_id=workspace_id,
+                                user_id=user_id,
+                                instructions=(
+                                    "Transcribe all readable text, headings, labels, diagram annotations, and table data "
+                                    "from this page image accurately in plain text."
+                                ),
+                                input_blocks=[
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "input_text", "text": f"Transcribe page {p_num} verbatim."},
+                                            {
+                                                "type": "input_image",
+                                                "image_url": f"data:image/png;base64,{b64_png}",
+                                                "detail": "high",
+                                            },
+                                        ],
+                                    }
+                                ],
+                                scope_key=f"ocr_txt:{doc_id}:p{p_num}",
+                            )
+                            if (plain_ocr or "").strip():
+                                page_blocks.setdefault(p_num, []).append(
+                                    {
+                                        "text": plain_ocr.strip(),
+                                        "word_count": len(plain_ocr.split()),
+                                        "bbox": BoundingBox(
+                                            left=0.05,
+                                            top=0.05,
+                                            width=0.90,
+                                            height=0.90,
+                                            page_number=p_num,
+                                        ),
+                                    }
+                                )
+                            else:
+                                partial_ocr_failures += 1
+                        except Exception as txt_ocr_err:
+                            print(f"[IngestionService] Vision OCR plain fallback warning on page {p_num}: {txt_ocr_err}")
+                            partial_ocr_failures += 1
 
             # -----------------------------------------------------------------
             # Stage 7 & 8: Commit Tables & Build Layout-Aware Coordinate Chunks

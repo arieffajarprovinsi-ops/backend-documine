@@ -276,7 +276,11 @@ class PDFProcessorService:
                     )
 
                 image_area_ratio = round(min(1.0, image_area / page_area), 4)
-                needs_ocr = bool(digital_word_count < 20 and (image_area_ratio > 0.20 or len(raw_blocks) == 0))
+                has_embedded_images = len(page.get_images(full=True)) > 0
+                needs_ocr = bool(
+                    digital_word_count < 20
+                    and (image_area_ratio > 0.05 or has_embedded_images or len(raw_blocks) == 0)
+                )
 
                 page_profiles.append(
                     {
