@@ -7,8 +7,8 @@ def build_default_routing_registry() -> Dict[AITaskType, ModelRoutePolicy]:
     """
     Authoritative Quality-Optimized Task Routing Table (DECIDED: ADR-006, ADR-008, ADR-017, DOC-30).
     - Embeddings: text-embedding-3-large (dimensions=1536)
-    - Stage 6/7 Vision OCR & Complex Tables: gpt-6.1-terra (flex -> auto)
-    - Stage 11 Single-Pass Document Understanding & KPIs: gpt-6.1-terra (flex -> auto)
+    - Stage 6/7 Vision OCR & Complex Tables: gpt-6.1-terra (auto low-latency)
+    - Stage 11 Single-Pass Document Understanding & KPIs: gpt-6.1-terra (auto low-latency)
     - Standard Grounded Chat Q&A: gpt-6.1-terra (auto SSE)
     - Deep / Multi-Doc Chat Q&A: gpt-6.1-sol (reasoning="medium")
     - Personalized Dashboard SQL & ECharts Planning: gpt-6.1-sol (reasoning="low")
@@ -42,8 +42,8 @@ def build_default_routing_registry() -> Dict[AITaskType, ModelRoutePolicy]:
             primary_model=settings.openai_model_balanced,  # gpt-6.1-terra
             fallback_provider=settings.ai_default_provider,
             fallback_model=settings.openai_model_deep,     # gpt-6.1-sol
-            service_tier="flex",
-            reasoning_effort="low",
+            service_tier="auto",
+            reasoning_effort="none",
             store=settings.openai_store_completions,
         ),
         AITaskType.DOCUMENT_UNDERSTANDING: ModelRoutePolicy(
@@ -52,7 +52,7 @@ def build_default_routing_registry() -> Dict[AITaskType, ModelRoutePolicy]:
             primary_model=settings.openai_model_balanced,  # gpt-6.1-terra
             fallback_provider=settings.ai_default_provider,
             fallback_model=settings.openai_model_fast,     # gpt-6-luna
-            service_tier="flex",
+            service_tier="auto",
             reasoning_effort="low",
             store=settings.openai_store_completions,
         ),

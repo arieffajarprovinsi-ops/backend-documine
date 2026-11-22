@@ -74,7 +74,7 @@ class Stage1FoundationTests(unittest.TestCase):
 
         doc_policy = ai_gateway.get_route_policy(AITaskType.DOCUMENT_UNDERSTANDING)
         self.assertEqual(doc_policy.primary_model, "gpt-6.1-terra")
-        self.assertEqual(doc_policy.service_tier, "flex")
+        self.assertEqual(doc_policy.service_tier, "auto")
         self.assertFalse(doc_policy.store)
 
         chat_policy = ai_gateway.get_route_policy(AITaskType.GROUNDED_CHAT_STANDARD)
