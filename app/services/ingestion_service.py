@@ -1,3 +1,4 @@
+import asyncio
 import math
 import os
 import re
@@ -259,99 +260,32 @@ class DocumentIngestionService:
                     {"current_stage": "stage_6_selective_vision_ocr", "progress_pct": 35},
                 )
                 total_ocr_pages = len(ocr_pages)
-                for ocr_idx, p_num in enumerate(ocr_pages, start=1):
-                    pct_tick = 35 + int((ocr_idx - 1) / max(1, total_ocr_pages) * 13)
-                    supabase_db.update_processing_job(
-                        workspace_id,
-                        job_id,
-                        {
-                            "current_stage": f"stage_6_vision_ocr_page_{ocr_idx}_of_{total_ocr_pages}",
-                            "progress_pct": pct_tick,
-                        },
-                    )
-                    try:
-                        b64_png = pdf_processor.render_page_png_base64(local_file_path, p_num, dpi=150)
-                        if not b64_png:
-                            continue
-                        ocr_res = await ai_gateway.generate_structured(
-                            task_type=AITaskType.VISION_OCR_AND_TABLES,
-                            workspace_id=workspace_id,
-                            user_id=user_id,
-                            instructions=(
-                                "Transcribe all readable text blocks, figure captions, and tables from this scanned "
-                                "document page accurately. Preserve numbers and units verbatim."
-                            ),
-                            input_blocks=[
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "input_text", "text": f"Extract text and tables from page {p_num}."},
-                                        {
-                                            "type": "input_image",
-                                            "image_url": f"data:image/png;base64,{b64_png}",
-                                            "detail": "high",
-                                        },
-                                    ],
-                                }
-                            ],
-                            response_model=OCRPageExtraction,
-                            scope_key=f"ocr:{doc_id}:p{p_num}",
+                ocr_sem = asyncio.Semaphore(4)
+                completed_ocr = 0
+
+                async def _process_ocr_page(p_num: int) -> bool:
+                    nonlocal completed_ocr
+                    async with ocr_sem:
+                        b64_png = await asyncio.to_thread(
+                            pdf_processor.render_page_png_base64, local_file_path, p_num, 120
                         )
-                        for blk in ocr_res.blocks:
-                            if blk.text.strip():
-                                y0 = max(0.0, min(0.95, float(blk.approx_y0)))
-                                y1 = max(y0 + 0.04, min(1.0, float(blk.approx_y1)))
-                                page_blocks.setdefault(p_num, []).append(
-                                    {
-                                        "text": blk.text.strip(),
-                                        "word_count": len(blk.text.split()),
-                                        "bbox": BoundingBox(
-                                            left=0.06,
-                                            top=round(y0, 4),
-                                            width=0.88,
-                                            height=round(y1 - y0, 4),
-                                            page_number=p_num,
-                                        ),
-                                    }
-                                )
-                        for desc in ocr_res.visual_chart_descriptions:
-                            if (desc or "").strip():
-                                page_blocks.setdefault(p_num, []).append(
-                                    {
-                                        "text": f"[Visual / Diagram Description - Page {p_num}]: {desc.strip()}",
-                                        "word_count": len(desc.split()),
-                                        "bbox": BoundingBox(left=0.06, top=0.08, width=0.88, height=0.84, page_number=p_num),
-                                    }
-                                )
-                        for tbl in ocr_res.extracted_tables:
-                            col_names = [c.name for c in tbl.columns]
-                            row_lines = [" | ".join(r) for r in tbl.rows if r]
-                            tbl_text = f"Table: {tbl.table_title}\nColumns: {' | '.join(col_names)}\n" + "\n".join(row_lines)
-                            if tbl_text.strip():
-                                page_blocks.setdefault(p_num, []).append(
-                                    {
-                                        "text": tbl_text.strip(),
-                                        "word_count": len(tbl_text.split()),
-                                        "bbox": BoundingBox(left=0.06, top=0.1, width=0.88, height=0.8, page_number=p_num),
-                                    }
-                                )
-                    except Exception as ocr_err:
-                        print(f"[IngestionService] Vision OCR structured warning on page {p_num}: {ocr_err}")
-                        # Fallback to plain-text Vision transcription if structured schema parse failed
+                        if not b64_png:
+                            return True
+                        page_ok = True
                         try:
-                            plain_ocr = await ai_gateway.generate_text(
+                            ocr_res = await ai_gateway.generate_structured(
                                 task_type=AITaskType.VISION_OCR_AND_TABLES,
                                 workspace_id=workspace_id,
                                 user_id=user_id,
                                 instructions=(
-                                    "Transcribe all readable text, headings, labels, diagram annotations, and table data "
-                                    "from this page image accurately in plain text."
+                                    "Transcribe all readable text blocks, figure captions, and tables from this scanned "
+                                    "document page accurately. Preserve numbers and units verbatim."
                                 ),
                                 input_blocks=[
                                     {
                                         "role": "user",
                                         "content": [
-                                            {"type": "input_text", "text": f"Transcribe page {p_num} verbatim."},
+                                            {"type": "input_text", "text": f"Extract text and tables from page {p_num}."},
                                             {
                                                 "type": "input_image",
                                                 "image_url": f"data:image/png;base64,{b64_png}",
@@ -360,27 +294,106 @@ class DocumentIngestionService:
                                         ],
                                     }
                                 ],
-                                scope_key=f"ocr_txt:{doc_id}:p{p_num}",
+                                response_model=OCRPageExtraction,
+                                scope_key=f"ocr:{doc_id}:p{p_num}",
                             )
-                            if (plain_ocr or "").strip():
-                                page_blocks.setdefault(p_num, []).append(
-                                    {
-                                        "text": plain_ocr.strip(),
-                                        "word_count": len(plain_ocr.split()),
-                                        "bbox": BoundingBox(
-                                            left=0.05,
-                                            top=0.05,
-                                            width=0.90,
-                                            height=0.90,
-                                            page_number=p_num,
-                                        ),
-                                    }
+                            for blk in ocr_res.blocks:
+                                if blk.text.strip():
+                                    y0 = max(0.0, min(0.95, float(blk.approx_y0)))
+                                    y1 = max(y0 + 0.04, min(1.0, float(blk.approx_y1)))
+                                    page_blocks.setdefault(p_num, []).append(
+                                        {
+                                            "text": blk.text.strip(),
+                                            "word_count": len(blk.text.split()),
+                                            "bbox": BoundingBox(
+                                                left=0.06,
+                                                top=round(y0, 4),
+                                                width=0.88,
+                                                height=round(y1 - y0, 4),
+                                                page_number=p_num,
+                                            ),
+                                        }
+                                    )
+                            for desc in ocr_res.visual_chart_descriptions:
+                                if (desc or "").strip():
+                                    page_blocks.setdefault(p_num, []).append(
+                                        {
+                                            "text": f"[Visual / Diagram Description - Page {p_num}]: {desc.strip()}",
+                                            "word_count": len(desc.split()),
+                                            "bbox": BoundingBox(left=0.06, top=0.08, width=0.88, height=0.84, page_number=p_num),
+                                        }
+                                    )
+                            for tbl in ocr_res.extracted_tables:
+                                col_names = [c.name for c in tbl.columns]
+                                row_lines = [" | ".join(r) for r in tbl.rows if r]
+                                tbl_text = f"Table: {tbl.table_title}\nColumns: {' | '.join(col_names)}\n" + "\n".join(row_lines)
+                                if tbl_text.strip():
+                                    page_blocks.setdefault(p_num, []).append(
+                                        {
+                                            "text": tbl_text.strip(),
+                                            "word_count": len(tbl_text.split()),
+                                            "bbox": BoundingBox(left=0.06, top=0.1, width=0.88, height=0.8, page_number=p_num),
+                                        }
+                                    )
+                        except Exception as ocr_err:
+                            print(f"[IngestionService] Vision OCR structured warning on page {p_num}: {ocr_err}")
+                            try:
+                                plain_ocr = await ai_gateway.generate_text(
+                                    task_type=AITaskType.VISION_OCR_AND_TABLES,
+                                    workspace_id=workspace_id,
+                                    user_id=user_id,
+                                    instructions=(
+                                        "Transcribe all readable text, headings, labels, diagram annotations, and table data "
+                                        "from this page image accurately in plain text."
+                                    ),
+                                    input_blocks=[
+                                        {
+                                            "role": "user",
+                                            "content": [
+                                                {"type": "input_text", "text": f"Transcribe page {p_num} verbatim."},
+                                                {
+                                                    "type": "input_image",
+                                                    "image_url": f"data:image/png;base64,{b64_png}",
+                                                    "detail": "high",
+                                                },
+                                            ],
+                                        }
+                                    ],
+                                    scope_key=f"ocr_txt:{doc_id}:p{p_num}",
                                 )
-                            else:
-                                partial_ocr_failures += 1
-                        except Exception as txt_ocr_err:
-                            print(f"[IngestionService] Vision OCR plain fallback warning on page {p_num}: {txt_ocr_err}")
-                            partial_ocr_failures += 1
+                                if (plain_ocr or "").strip():
+                                    page_blocks.setdefault(p_num, []).append(
+                                        {
+                                            "text": plain_ocr.strip(),
+                                            "word_count": len(plain_ocr.split()),
+                                            "bbox": BoundingBox(
+                                                left=0.05,
+                                                top=0.05,
+                                                width=0.90,
+                                                height=0.90,
+                                                page_number=p_num,
+                                            ),
+                                        }
+                                    )
+                                else:
+                                    page_ok = False
+                            except Exception as txt_ocr_err:
+                                print(f"[IngestionService] Vision OCR plain fallback warning on page {p_num}: {txt_ocr_err}")
+                                page_ok = False
+                        completed_ocr += 1
+                        pct_tick = 35 + int(completed_ocr / max(1, total_ocr_pages) * 13)
+                        supabase_db.update_processing_job(
+                            workspace_id,
+                            job_id,
+                            {
+                                "current_stage": f"stage_6_vision_ocr_page_{completed_ocr}_of_{total_ocr_pages}",
+                                "progress_pct": pct_tick,
+                            },
+                        )
+                        return page_ok
+
+                ocr_outcomes = await asyncio.gather(*[_process_ocr_page(p) for p in ocr_pages])
+                partial_ocr_failures = sum(1 for ok in ocr_outcomes if not ok)
 
             # -----------------------------------------------------------------
             # Stage 7 & 8: Commit Tables & Build Layout-Aware Coordinate Chunks
