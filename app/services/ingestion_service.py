@@ -258,7 +258,17 @@ class DocumentIngestionService:
                     job_id,
                     {"current_stage": "stage_6_selective_vision_ocr", "progress_pct": 35},
                 )
-                for p_num in ocr_pages:
+                total_ocr_pages = len(ocr_pages)
+                for ocr_idx, p_num in enumerate(ocr_pages, start=1):
+                    pct_tick = 35 + int((ocr_idx - 1) / max(1, total_ocr_pages) * 13)
+                    supabase_db.update_processing_job(
+                        workspace_id,
+                        job_id,
+                        {
+                            "current_stage": f"stage_6_vision_ocr_page_{ocr_idx}_of_{total_ocr_pages}",
+                            "progress_pct": pct_tick,
+                        },
+                    )
                     try:
                         b64_png = pdf_processor.render_page_png_base64(local_file_path, p_num, dpi=150)
                         if not b64_png:

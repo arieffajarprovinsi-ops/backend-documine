@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional, Dict, Any
 from fastapi import BackgroundTasks
 from app.core.config import settings
@@ -49,15 +50,21 @@ async def dispatch_ingestion_job(
             from arq import create_pool
             from arq.connections import RedisSettings
 
-            pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-            await pool.enqueue_job(
-                "arq_ingest_document_task",
-                workspace_id=workspace_id,
-                doc_id=doc_id,
-                job_id=job_id,
-                local_file_path=local_file_path,
-                user_id=user_id,
-                expected_version=expected_version,
+            pool = await asyncio.wait_for(
+                create_pool(RedisSettings.from_dsn(settings.redis_url)),
+                timeout=3.0,
+            )
+            await asyncio.wait_for(
+                pool.enqueue_job(
+                    "arq_ingest_document_task",
+                    workspace_id=workspace_id,
+                    doc_id=doc_id,
+                    job_id=job_id,
+                    local_file_path=local_file_path,
+                    user_id=user_id,
+                    expected_version=expected_version,
+                ),
+                timeout=3.0,
             )
             await pool.close()
             return "arq_redis"
