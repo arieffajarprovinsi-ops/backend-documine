@@ -77,13 +77,14 @@ def _detect_user_language(text: str) -> str:
 
 _INSTANT_SMALL_TALK_RE = re.compile(
     r"^\s*(?:"
-    r"p+|tes+|test(?:ing)?|halo+(?:\s+(?:bang|bro|mas|mbak|kak|min|admin|ai|bot|documind))?|"
+    r"p+|tes+|test(?:ing)?|halo+(?:\s+(?:bang|bro|mas|mbak|kak|min|admin|ai|bot|documind|semua\w*))?|"
     r"hai+(?:\s+(?:bang|bro|mas|kak|ai))?|hi+|hey+|hello+|yo+|"
-    r"(?:selamat\s+)?(?:pagi|siang|sore|malam)|good\s+(?:morning|afternoon|evening|night)|"
+    r"(?:selamat\s+)?(?:pagi|siang|sore|malam)(?:\s+(?:bang|bro|mas|kak|pak|bu|min))?|"
+    r"good\s+(?:morning|afternoon|evening|night)|"
     r"ass?alam(?:u'?alaikum)?|wa'?alaikum(?:salam)?|"
     r"(?:apa\s+kabar|kabarnya|how\s+are\s+you)|"
-    r"(?:terima\s+kasih|makasih|thanks?(?:\s+you)?|thx|ty)|"
-    r"(?:ok(?:e|ay)?|siap+|mantap+|sip+|baik+|noted|cool|nice|great|awesome)|"
+    r"(?:terima\s+kasih|makasih|thanks?(?:\s+you)?|thx|ty)(?:\s+(?:banyak|ya+|yah|banget|bang|kak|bro|min))?|"
+    r"(?:ok(?:e|ay)?|siap+|mantap+|sip+|baik+|noted|cool|nice|great|awesome)(?:\s+(?:bang|kak|bro|min|makasih|terima\s+kasih|thanks))?|"
     r"(?:siapa\s+(?:kamu|anda|lu)|kamu\s+bisa\s+apa|who\s+are\s+you|what\s+can\s+you\s+do)"
     r")[\s!?.~,]*$",
     re.IGNORECASE,
