@@ -191,6 +191,9 @@ def _compute_mean_centroid(vectors: List[List[float]]) -> Optional[List[float]]:
     return [round(x / norm, 6) for x in mean_vec]
 
 
+_INGESTION_SEMAPHORE = asyncio.Semaphore(3)
+
+
 class DocumentIngestionService:
     """
     15-Stage Checkpointed Document Ingestion Pipeline (DOC-10, DOC-24, ADR-005, ADR-006, ADR-008, ADR-010, ADR-014).
@@ -206,8 +209,28 @@ class DocumentIngestionService:
         user_id: Optional[str] = None,
         expected_version: int = 1,
     ) -> Dict[str, Any]:
+        async with _INGESTION_SEMAPHORE:
+            return await self._execute_pipeline_inner(
+                workspace_id=workspace_id,
+                doc_id=doc_id,
+                job_id=job_id,
+                local_file_path=local_file_path,
+                user_id=user_id,
+                expected_version=expected_version,
+            )
+
+    async def _execute_pipeline_inner(
+        self,
+        *,
+        workspace_id: str,
+        doc_id: str,
+        job_id: str,
+        local_file_path: str,
+        user_id: Optional[str] = None,
+        expected_version: int = 1,
+    ) -> Dict[str, Any]:
         try:
-            doc_record = supabase_db.get_workspace_document(workspace_id, doc_id)
+            doc_record = await asyncio.to_thread(supabase_db.get_workspace_document, workspace_id, doc_id)
             if not doc_record:
                 raise RuntimeError(f"Document {doc_id} no longer exists in workspace {workspace_id}.")
 
@@ -215,15 +238,18 @@ class DocumentIngestionService:
             ext = os.path.splitext(local_file_path.lower())[1]
 
             # Update status to processing (Stage 3)
-            if not supabase_db.update_document(
+            ok_update = await asyncio.to_thread(
+                supabase_db.update_document,
                 workspace_id,
                 doc_id,
                 {"status": "processing", "processing_status": "processing"},
-                expected_version=expected_version,
-            ):
+                expected_version,
+            )
+            if not ok_update:
                 raise RuntimeError("Stale ingestion job aborted: document version changed or was deleted.")
 
-            supabase_db.update_processing_job(
+            await asyncio.to_thread(
+                supabase_db.update_processing_job,
                 workspace_id,
                 job_id,
                 {"status": "running", "current_stage": "stage_3_5_layout_and_pages", "progress_pct": 20},
@@ -233,15 +259,17 @@ class DocumentIngestionService:
             # Stages 3, 4, 5 & 7 (Deterministic Layout, BBox & Table Extraction)
             # -----------------------------------------------------------------
             if ext in (".csv", ".xlsx"):
-                page_profiles, page_blocks, extracted_tables = pdf_processor.extract_spreadsheet_tables_and_blocks(
-                    local_file_path
+                page_profiles, page_blocks, extracted_tables = await asyncio.to_thread(
+                    pdf_processor.extract_spreadsheet_tables_and_blocks,
+                    local_file_path,
                 )
             else:
-                page_profiles, page_blocks, extracted_tables = pdf_processor.analyze_pdf_pages_and_blocks(
-                    local_file_path
+                page_profiles, page_blocks, extracted_tables = await asyncio.to_thread(
+                    pdf_processor.analyze_pdf_pages_and_blocks,
+                    local_file_path,
                 )
 
-            supabase_db.save_document_pages(workspace_id, doc_id, page_profiles)
+            await asyncio.to_thread(supabase_db.save_document_pages, workspace_id, doc_id, page_profiles)
 
             # -----------------------------------------------------------------
             # Stage 6: Selective Vision OCR via gpt-6.1-terra (ONLY if needed)
@@ -398,15 +426,19 @@ class DocumentIngestionService:
             # -----------------------------------------------------------------
             # Stage 7 & 8: Commit Tables & Build Layout-Aware Coordinate Chunks
             # -----------------------------------------------------------------
-            supabase_db.update_processing_job(
+            await asyncio.to_thread(
+                supabase_db.update_processing_job,
                 workspace_id,
                 job_id,
                 {"current_stage": "stage_7_8_tables_and_chunking", "progress_pct": 50},
             )
-            saved_tables = supabase_db.replace_document_tables(workspace_id, doc_id, extracted_tables)
+            saved_tables = await asyncio.to_thread(
+                supabase_db.replace_document_tables, workspace_id, doc_id, extracted_tables
+            )
             table_pages = {int(t.get("page_number", 1)) for t in saved_tables}
 
-            chunk_models = pdf_processor.build_layout_chunks(
+            chunk_models = await asyncio.to_thread(
+                pdf_processor.build_layout_chunks,
                 document_id=doc_id,
                 workspace_id=workspace_id,
                 page_blocks=page_blocks,
@@ -467,7 +499,9 @@ class DocumentIngestionService:
                     }
                 )
 
-            saved_chunks = supabase_db.replace_document_chunks(workspace_id, doc_id, chunk_dicts)
+            saved_chunks = await asyncio.to_thread(
+                supabase_db.replace_document_chunks, workspace_id, doc_id, chunk_dicts
+            )
 
             # -----------------------------------------------------------------
             # Stage 11: Single-Pass Document Understanding (gpt-6.1-terra)
@@ -552,19 +586,23 @@ class DocumentIngestionService:
                         }
                     )
 
-            saved_metrics = supabase_db.replace_extracted_metrics(workspace_id, doc_id, verified_metrics)
+            saved_metrics = await asyncio.to_thread(
+                supabase_db.replace_extracted_metrics, workspace_id, doc_id, verified_metrics
+            )
 
             # -----------------------------------------------------------------
             # Stage 13: Centroid Vector, Topics, Entities & Relationships (DOC-16)
             # -----------------------------------------------------------------
-            supabase_db.update_processing_job(
+            await asyncio.to_thread(
+                supabase_db.update_processing_job,
                 workspace_id,
                 job_id,
                 {"current_stage": "stage_13_relationships_and_graph", "progress_pct": 92},
             )
             centroid = _compute_mean_centroid(vectors)
             first_chunk_id = str(saved_chunks[0]["id"]) if saved_chunks else None
-            supabase_db.upsert_topics_and_entities(
+            await asyncio.to_thread(
+                supabase_db.upsert_topics_and_entities,
                 workspace_id=workspace_id,
                 doc_id=doc_id,
                 topics=understanding.main_topics,
@@ -576,7 +614,8 @@ class DocumentIngestionService:
             # Stage 14 & 15: Commit Final Document State & Complete Job
             # -----------------------------------------------------------------
             final_status = "partial_ready" if partial_ocr_failures > 0 else "ready"
-            updated_doc = supabase_db.update_document(
+            updated_doc = await asyncio.to_thread(
+                supabase_db.update_document,
                 workspace_id,
                 doc_id,
                 {
@@ -596,12 +635,13 @@ class DocumentIngestionService:
                     "centroid_embedding": centroid,
                     "processed_at": _utc_now_iso(),
                 },
-                expected_version=expected_version,
+                expected_version,
             )
 
-            supabase_db.compute_and_save_relationships(workspace_id, doc_id)
+            await asyncio.to_thread(supabase_db.compute_and_save_relationships, workspace_id, doc_id)
 
-            supabase_db.update_processing_job(
+            await asyncio.to_thread(
+                supabase_db.update_processing_job,
                 workspace_id,
                 job_id,
                 {

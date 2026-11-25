@@ -225,10 +225,16 @@ class DashboardGenerationPlan(BaseModel):
     source_chunk_ids: List[str] = Field(default_factory=list)
 
 
+class DocumentFindingEntry(BaseModel):
+    doc_id: str = Field(description="Exact document ID from the provided overview")
+    finding: str = Field(description="Concise document-specific finding with [cite:CHUNK_ID]")
+
+
 class SynthesisComparisonRow(BaseModel):
     dimension_name: str
-    per_document_findings: Dict[str, str] = Field(
-        description="Mapping of doc_id -> concise finding with [cite:CHUNK_ID]"
+    findings_list: List[DocumentFindingEntry] = Field(
+        default_factory=list,
+        description="Per-document findings for this comparison dimension with [cite:CHUNK_ID]",
     )
     consensus_or_divergence: str
 
@@ -304,6 +310,23 @@ class AudioBriefingScriptPayload(BaseModel):
     title: str
     duration_estimate_seconds: int = 90
     dialogue: List[DialogueSegmentSchema]
+
+
+class StoryChapterSchema(BaseModel):
+    chapter_title: str = Field(
+        description="Engaging chapter heading, e.g. 'Babak 1 · Konteks Utama' or 'Chapter 1 · The Core Context'"
+    )
+    narration: str = Field(
+        description="Fluid, natural single-narrator storytelling prose (3-5 spoken sentences) grounded in the document."
+    )
+    source_chunk_id: Optional[str] = None
+
+
+class StorytellingScriptPayload(BaseModel):
+    title: str
+    duration_estimate_seconds: int = 95
+    takeaway_summary: str = Field(description="1-2 sentence memorable closing takeaway from the story.")
+    chapters: List[StoryChapterSchema]
 
 
 class ChatIntentRoute(BaseModel):

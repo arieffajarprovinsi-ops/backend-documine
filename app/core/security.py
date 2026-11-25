@@ -93,20 +93,39 @@ def verify_supabase_bearer_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+_inflight_token_locks: Dict[str, asyncio.Lock] = {}
+
+
 async def get_optional_current_user(
     authorization: Optional[str] = Header(default=None),
 ) -> Optional[Dict[str, Any]]:
     """
     Validates Bearer token when provided without blocking the asyncio event loop;
-    returns None when unauthenticated unless strict enforcement is required by a route.
+    coalesces concurrent in-flight GoTrue checks on cold dashboard loads.
     """
     token = extract_bearer_token(authorization)
     if not token:
         return None
 
-    user = await asyncio.to_thread(verify_supabase_bearer_token, token)
+    token_fp = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+    cache_key = "tok:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+    fast_cached = token_verification_cache.get(cache_key)
+    if fast_cached is not None:
+        user = dict(fast_cached)
+        user["_access_token"] = token
+        return user
+
+    lock = _inflight_token_locks.setdefault(token_fp, asyncio.Lock())
+    try:
+        async with lock:
+            user = await asyncio.to_thread(verify_supabase_bearer_token, token)
+    finally:
+        if len(_inflight_token_locks) > 512:
+            _inflight_token_locks.pop(token_fp, None)
+
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+    user = dict(user)
     user["_access_token"] = token
     return user
 

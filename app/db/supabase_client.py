@@ -1,21 +1,61 @@
+import json
 import math
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 from app.core.config import settings
+from app.core.hardening import workspace_docs_cache
+
+DOCUMENT_LIGHT_COLUMNS = (
+    "id, workspace_id, uploaded_by, title, original_filename, storage_path, file_type, "
+    "file_sha256, mime_type, page_count, file_size_bytes, processing_status, status, "
+    "category, primary_domain, language_code, summary, key_findings, main_topics, "
+    "key_dates, user_tags, has_tables, table_count, metric_count, ingestion_version, "
+    "metadata, error_message, created_at, updated_at, processed_at"
+)
+
+CHUNK_LIGHT_COLUMNS = (
+    "id, document_id, doc_id, workspace_id, chunk_index, content, text_content, "
+    "page_number, bounding_boxes, embedding_model, token_count, has_table, metadata, created_at"
+)
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _cosine_similarity(vec_a: Optional[List[float]], vec_b: Optional[List[float]]) -> float:
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+def _coerce_vector(vec: Any) -> Optional[List[float]]:
+    if vec is None:
+        return None
+    if isinstance(vec, str):
+        s = vec.strip()
+        if not s:
+            return None
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return [float(x) for x in parsed]
+        except Exception:
+            return None
+        return None
+    if isinstance(vec, (list, tuple)):
+        try:
+            return [float(x) for x in vec]
+        except Exception:
+            return None
+    return None
+
+
+def _cosine_similarity(vec_a: Any, vec_b: Any) -> float:
+    va = _coerce_vector(vec_a)
+    vb = _coerce_vector(vec_b)
+    if not va or not vb or len(va) != len(vb):
         return 0.0
-    dot = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a)) or 1.0
-    norm_b = math.sqrt(sum(b * b for b in vec_b)) or 1.0
+    dot = sum(a * b for a, b in zip(va, vb))
+    norm_a = math.sqrt(sum(a * a for a in va)) or 1.0
+    norm_b = math.sqrt(sum(b * b for b in vb)) or 1.0
     return float(dot / (norm_a * norm_b))
 
 
@@ -27,7 +67,10 @@ class SupabaseManager:
     """
 
     def __init__(self):
-        self.client = None
+        self._primary_client = None
+        self._override_client = None
+        self._has_override = False
+        self._thread_local = threading.local()
         self._local_tables: Dict[str, List[Dict[str, Any]]] = {
             "workspaces": [],
             "workspace_members": [],
@@ -51,23 +94,45 @@ class SupabaseManager:
         }
         self._init_client()
 
-    def _init_client(self):
+    def _create_fresh_client(self):
         service_key = settings.effective_supabase_service_key
         if settings.supabase_url and service_key:
             try:
-                from supabase import create_client, Client
+                from supabase import create_client
 
-                self.client: Optional[Client] = create_client(
-                    settings.supabase_url,
-                    service_key,
-                )
+                return create_client(settings.supabase_url, service_key)
             except Exception as e:
                 print(
                     f"[Supabase] Warning: Failed to connect to remote Supabase ({e}). Using local tenant-isolated store."
                 )
-                self.client = None
-        else:
-            self.client = None
+        return None
+
+    def _init_client(self):
+        self._primary_client = self._create_fresh_client()
+
+    @property
+    def client(self):
+        """
+        Thread-safe Supabase client accessor:
+        Each OS worker thread in `asyncio.to_thread(...)` gets its own isolated HTTP/2
+        connection pool so concurrent `asyncio.gather` calls never race on a shared socket.
+        """
+        if self._has_override:
+            return self._override_client
+        if self._primary_client is None:
+            return None
+        if threading.current_thread() is threading.main_thread():
+            return self._primary_client
+        tl_client = getattr(self._thread_local, "client", None)
+        if tl_client is None:
+            tl_client = self._create_fresh_client() or self._primary_client
+            self._thread_local.client = tl_client
+        return tl_client
+
+    @client.setter
+    def client(self, val) -> None:
+        self._override_client = val
+        self._has_override = True
 
     @property
     def is_connected(self) -> bool:
@@ -342,6 +407,7 @@ class SupabaseManager:
         self._local_tables["processing_jobs"] = [
             j for j in self._local_tables["processing_jobs"] if j.get("id") != job_id
         ] + [dict(job_row)]
+        workspace_docs_cache.invalidate_prefix(f"docs:{workspace_id}")
 
         return doc_row, job_row
 
@@ -356,6 +422,7 @@ class SupabaseManager:
             raise ValueError("workspace_id and doc_id are mandatory.")
 
         payload = {**updates, "updated_at": _utc_now_iso()}
+        workspace_docs_cache.invalidate_prefix(f"docs:{workspace_id}")
         # Keep status and processing_status synchronized
         if "status" in payload and "processing_status" not in payload:
             st = payload["status"]
@@ -390,6 +457,7 @@ class SupabaseManager:
         updates: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         payload = {**updates, "updated_at": _utc_now_iso()}
+        workspace_docs_cache.invalidate_prefix(f"docs:{workspace_id}")
         if self.is_connected:
             try:
                 res = (
@@ -600,38 +668,34 @@ class SupabaseManager:
         representative_chunk_id: Optional[str] = None,
     ) -> None:
         now = _utc_now_iso()
+        topic_rows_map: Dict[str, Dict[str, Any]] = {}
+        chunk_topic_rows: List[Dict[str, Any]] = []
+
         for raw_topic in topics:
             name = (raw_topic or "").strip()
             if not name:
                 continue
             slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-            if not slug:
+            if not slug or slug in topic_rows_map:
                 continue
             topic_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"topic:{workspace_id}:{slug}"))
-            if self.is_connected:
-                try:
-                    self.client.table("topics").upsert(
-                        {
-                            "id": topic_id,
-                            "workspace_id": workspace_id,
-                            "name": name,
-                            "slug": slug,
-                            "category": "concept",
-                        },
-                        on_conflict="id",
-                    ).execute()
-                    if representative_chunk_id:
-                        self.client.table("chunk_topics").upsert(
-                            {
-                                "chunk_id": representative_chunk_id,
-                                "topic_id": topic_id,
-                                "workspace_id": workspace_id,
-                                "doc_id": doc_id,
-                                "relevance_score": 1.0,
-                            }
-                        ).execute()
-                except Exception:
-                    pass
+            topic_rows_map[slug] = {
+                "id": topic_id,
+                "workspace_id": workspace_id,
+                "name": name,
+                "slug": slug,
+                "category": "concept",
+            }
+            if representative_chunk_id:
+                chunk_topic_rows.append(
+                    {
+                        "chunk_id": representative_chunk_id,
+                        "topic_id": topic_id,
+                        "workspace_id": workspace_id,
+                        "doc_id": doc_id,
+                        "relevance_score": 1.0,
+                    }
+                )
 
             existing_t = next(
                 (t for t in self._local_tables["topics"] if t.get("workspace_id") == workspace_id and t.get("slug") == slug),
@@ -660,36 +724,46 @@ class SupabaseManager:
                     }
                 )
 
+        if self.is_connected and topic_rows_map:
+            try:
+                self.client.table("topics").upsert(
+                    list(topic_rows_map.values()),
+                    on_conflict="id",
+                ).execute()
+                if chunk_topic_rows:
+                    self.client.table("chunk_topics").upsert(chunk_topic_rows).execute()
+            except Exception:
+                pass
+
+        entity_rows_map: Dict[str, Dict[str, Any]] = {}
+        doc_entity_rows: List[Dict[str, Any]] = []
+
         for ent in entities:
             ename = (ent.get("name") or "").strip()
             canonical = (ent.get("canonical_name") or ename.lower()).strip()
             etype = ent.get("entity_type") or "other"
             if not ename or not canonical:
                 continue
+            dedup_key = f"{canonical}:{etype}"
+            if dedup_key in entity_rows_map:
+                continue
             entity_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"entity:{workspace_id}:{canonical}:{etype}"))
-            if self.is_connected:
-                try:
-                    self.client.table("entities").upsert(
-                        {
-                            "id": entity_id,
-                            "workspace_id": workspace_id,
-                            "name": ename,
-                            "canonical_name": canonical,
-                            "entity_type": etype,
-                        },
-                        on_conflict="workspace_id,canonical_name,entity_type",
-                    ).execute()
-                    self.client.table("document_entities").upsert(
-                        {
-                            "workspace_id": workspace_id,
-                            "doc_id": doc_id,
-                            "entity_id": entity_id,
-                            "representative_chunk_id": representative_chunk_id,
-                            "mention_count": 1,
-                        }
-                    ).execute()
-                except Exception:
-                    pass
+            entity_rows_map[dedup_key] = {
+                "id": entity_id,
+                "workspace_id": workspace_id,
+                "name": ename,
+                "canonical_name": canonical,
+                "entity_type": etype,
+            }
+            doc_entity_rows.append(
+                {
+                    "workspace_id": workspace_id,
+                    "doc_id": doc_id,
+                    "entity_id": entity_id,
+                    "representative_chunk_id": representative_chunk_id,
+                    "mention_count": 1,
+                }
+            )
 
             if not any(
                 e.get("workspace_id") == workspace_id
@@ -721,38 +795,69 @@ class SupabaseManager:
                 }
             ]
 
+        if self.is_connected and entity_rows_map:
+            try:
+                self.client.table("entities").upsert(
+                    list(entity_rows_map.values()),
+                    on_conflict="workspace_id,canonical_name,entity_type",
+                ).execute()
+                if doc_entity_rows:
+                    self.client.table("document_entities").upsert(doc_entity_rows).execute()
+            except Exception:
+                pass
+
     # -------------------------------------------------------------------------
     # 3. Document Relationship Discovery Engine (Stage 13 - DOC-16, ADR-013)
     # -------------------------------------------------------------------------
-    def _get_doc_entity_ids(self, workspace_id: str, doc_id: str) -> set[str]:
-        entity_ids: set[str] = set()
+    def _get_workspace_entity_map(self, workspace_id: str) -> Dict[str, set[str]]:
+        """Batch-fetch all document entity IDs in 1 query instead of N per-document HTTP queries."""
+        by_doc: Dict[str, set[str]] = {}
         if self.is_connected:
             try:
                 res = (
                     self.client.table("document_entities")
-                    .select("entity_id")
+                    .select("doc_id, entity_id")
                     .eq("workspace_id", workspace_id)
-                    .eq("doc_id", doc_id)
                     .execute()
                 )
                 for row in res.data or []:
-                    if row.get("entity_id"):
-                        entity_ids.add(str(row["entity_id"]))
+                    did = str(row.get("doc_id") or "")
+                    eid = str(row.get("entity_id") or "")
+                    if did and eid:
+                        by_doc.setdefault(did, set()).add(eid)
             except Exception:
                 pass
         for de in self._local_tables["document_entities"]:
-            if de.get("workspace_id") == workspace_id and de.get("doc_id") == doc_id and de.get("entity_id"):
-                entity_ids.add(str(de["entity_id"]))
-        return entity_ids
+            if de.get("workspace_id") == workspace_id and de.get("doc_id") and de.get("entity_id"):
+                by_doc.setdefault(str(de["doc_id"]), set()).add(str(de["entity_id"]))
+        return by_doc
 
     def compute_and_save_relationships(self, workspace_id: str, doc_id: str) -> List[Dict[str, Any]]:
-        docs = self.list_workspace_documents(workspace_id)
+        if self.is_connected:
+            try:
+                res_docs = (
+                    self.client.table("documents")
+                    .select("id, title, main_topics, centroid_embedding")
+                    .eq("workspace_id", workspace_id)
+                    .execute()
+                )
+                docs = res_docs.data or []
+            except Exception:
+                docs = self.list_workspace_documents(workspace_id, include_embeddings=True)
+        else:
+            docs = self.list_workspace_documents(workspace_id, include_embeddings=True)
+
+        local_docs = [d for d in self._local_tables["documents"] if d.get("workspace_id") == workspace_id]
+        seen_ids = {d.get("id") for d in docs if d.get("id")}
+        docs = docs + [dict(d) for d in local_docs if d.get("id") not in seen_ids]
+
         target_doc = next((d for d in docs if d["id"] == doc_id), None)
         if not target_doc:
             return []
 
+        entity_map = self._get_workspace_entity_map(workspace_id)
         target_topics = {t.lower() for t in (target_doc.get("main_topics") or []) if t}
-        target_entities = self._get_doc_entity_ids(workspace_id, doc_id)
+        target_entities = entity_map.get(doc_id, set())
         target_vec = target_doc.get("centroid_embedding")
         created_edges: List[Dict[str, Any]] = []
         now = _utc_now_iso()
@@ -763,7 +868,7 @@ class SupabaseManager:
                 continue
             other_topics = {t.lower() for t in (other.get("main_topics") or []) if t}
             shared_topics = sorted(target_topics.intersection(other_topics))
-            other_entities = self._get_doc_entity_ids(workspace_id, other_id)
+            other_entities = entity_map.get(other_id, set())
             shared_entity_count = len(target_entities.intersection(other_entities))
 
             sim = _cosine_similarity(target_vec, other.get("centroid_embedding"))
@@ -966,23 +1071,45 @@ class SupabaseManager:
         has_tables: Optional[bool] = None,
         sort_by: str = "created_at",
         sort_dir: str = "desc",
+        include_embeddings: bool = False,
     ) -> List[Dict[str, Any]]:
         if not workspace_id:
             raise ValueError("workspace_id is mandatory.")
 
-        remote_docs: List[Dict[str, Any]] = []
-        if self.is_connected:
-            try:
-                res = (
-                    self.client.table("documents")
-                    .select("*")
-                    .eq("workspace_id", workspace_id)
-                    .order("created_at", desc=True)
-                    .execute()
-                )
-                remote_docs = res.data or []
-            except Exception:
-                pass
+        cache_key = f"docs:{workspace_id}:base"
+        remote_docs: Optional[List[Dict[str, Any]]] = None
+        if not include_embeddings:
+            cached_base = workspace_docs_cache.get(cache_key)
+            if cached_base is not None:
+                remote_docs = [dict(d) for d in cached_base]
+
+        if remote_docs is None:
+            remote_docs = []
+            if self.is_connected:
+                cols = "*" if include_embeddings else DOCUMENT_LIGHT_COLUMNS
+                try:
+                    res = (
+                        self.client.table("documents")
+                        .select(cols)
+                        .eq("workspace_id", workspace_id)
+                        .order("created_at", desc=True)
+                        .execute()
+                    )
+                    remote_docs = res.data or []
+                except Exception:
+                    try:
+                        res = (
+                            self.client.table("documents")
+                            .select("*")
+                            .eq("workspace_id", workspace_id)
+                            .order("created_at", desc=True)
+                            .execute()
+                        )
+                        remote_docs = res.data or []
+                    except Exception:
+                        pass
+            if not include_embeddings and remote_docs:
+                workspace_docs_cache.set(cache_key, remote_docs, ttl_seconds=8.0)
 
         local_docs = [d for d in self._local_tables["documents"] if d.get("workspace_id") == workspace_id]
         seen_ids = {d.get("id") for d in remote_docs if d.get("id")}
@@ -1028,7 +1155,7 @@ class SupabaseManager:
             try:
                 res = (
                     self.client.table("documents")
-                    .select("*")
+                    .select(DOCUMENT_LIGHT_COLUMNS)
                     .eq("workspace_id", workspace_id)
                     .eq("id", doc_id)
                     .limit(1)
@@ -1037,7 +1164,19 @@ class SupabaseManager:
                 if res.data:
                     return res.data[0]
             except Exception:
-                pass
+                try:
+                    res = (
+                        self.client.table("documents")
+                        .select("*")
+                        .eq("workspace_id", workspace_id)
+                        .eq("id", doc_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    if res.data:
+                        return res.data[0]
+                except Exception:
+                    pass
         for d in self._local_tables["documents"]:
             if d.get("workspace_id") == workspace_id and d.get("id") == doc_id:
                 return dict(d)
@@ -1050,7 +1189,7 @@ class SupabaseManager:
             try:
                 res = (
                     self.client.table("chunks")
-                    .select("*")
+                    .select(CHUNK_LIGHT_COLUMNS)
                     .eq("workspace_id", workspace_id)
                     .eq("doc_id", doc_id)
                     .order("chunk_index", desc=False)
@@ -1059,7 +1198,19 @@ class SupabaseManager:
                 if res.data:
                     return res.data
             except Exception:
-                pass
+                try:
+                    res = (
+                        self.client.table("chunks")
+                        .select("*")
+                        .eq("workspace_id", workspace_id)
+                        .eq("doc_id", doc_id)
+                        .order("chunk_index", desc=False)
+                        .execute()
+                    )
+                    if res.data:
+                        return res.data
+                except Exception:
+                    pass
         chunks = [
             dict(c)
             for c in self._local_tables["chunks"]
@@ -1116,6 +1267,7 @@ class SupabaseManager:
         return remote + [m for m in local if m.get("id") not in seen]
 
     def delete_workspace_document(self, workspace_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
+        workspace_docs_cache.invalidate_prefix(f"docs:{workspace_id}")
         doc = self.get_workspace_document(workspace_id, doc_id)
         if not doc:
             return None
@@ -1168,6 +1320,45 @@ class SupabaseManager:
     # -------------------------------------------------------------------------
     # 5. Hybrid RRF Search (match_document_chunks_hybrid + Local RRF Engine - DOC-12)
     # -------------------------------------------------------------------------
+    _FTS_QUESTION_STOPWORDS = {
+        "what", "which", "where", "when", "who", "whom", "whose", "why", "how",
+        "the", "and", "for", "with", "from", "that", "this", "these", "those",
+        "are", "was", "were", "been", "being", "have", "has", "had", "does", "did",
+        "can", "could", "would", "should", "will", "shall", "may", "might", "must",
+        "about", "into", "across", "between", "among", "please", "tell", "give",
+        "show", "explain", "summarize", "summary", "compare", "document", "documents",
+        "file", "files", "pdf", "pdfs", "all", "both", "each", "every",
+        "apa", "siapa", "kapan", "dimana", "bagaimana", "gimana", "berapa", "kenapa",
+        "mengapa", "tolong", "jelaskan", "ringkas", "ringkasan", "rangkum", "bandingkan",
+        "perbandingan", "dokumen", "semua", "keempat", "ketiga", "kedua", "dari",
+        "yang", "dan", "atau", "untuk", "pada", "dalam", "dengan", "ini", "itu",
+    }
+
+    @classmethod
+    def _build_fts_or_query(cls, raw_query: str) -> str:
+        """
+        Convert natural-language user prompts into an OR-joined PostgreSQL
+        `websearch_to_tsquery('simple', ...)` expression so conversational words
+        ('please', 'compare', 'ringkas') never zero out full-text recall, while
+        `ts_rank_cd` still ranks passages matching the most terms highest.
+        """
+        tokens = re.findall(r"[A-Za-z0-9]{2,}", (raw_query or "").strip())
+        if not tokens:
+            return ""
+        meaningful: List[str] = []
+        seen: set[str] = set()
+        for tok in tokens:
+            low = tok.lower()
+            if low in cls._FTS_QUESTION_STOPWORDS or low in seen:
+                continue
+            seen.add(low)
+            meaningful.append(low)
+            if len(meaningful) >= 12:
+                break
+        if not meaningful:
+            meaningful = [t.lower() for t in tokens[:6]]
+        return " OR ".join(meaningful)
+
     def search_chunks_hybrid(
         self,
         *,
@@ -1186,10 +1377,11 @@ class SupabaseManager:
 
         if self.is_connected:
             try:
+                fts_query = self._build_fts_or_query(query_text)
                 rpc_params: Dict[str, Any] = {
                     "filter_workspace_id": workspace_id,
                     "query_embedding": query_embedding,
-                    "query_text": query_text or "",
+                    "query_text": fts_query or (query_text or ""),
                     "match_count": match_count,
                     "filter_doc_ids": doc_ids if doc_ids else None,
                     "filter_category": category,
@@ -1198,8 +1390,7 @@ class SupabaseManager:
                     "rrf_k": rrf_k,
                 }
                 res = self.client.rpc("match_document_chunks_hybrid", rpc_params).execute()
-                if res.data:
-                    return res.data
+                return res.data or []
             except Exception as e:
                 print(f"[Supabase] Hybrid RPC fallback to in-process RRF ({e}).")
 
@@ -1400,6 +1591,7 @@ class SupabaseManager:
         return remote + [c for c in local if c.get("id") not in seen]
 
     def get_conversation_messages(self, workspace_id: str, conversation_id: str) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
         if self.is_connected:
             try:
                 res = (
@@ -1411,14 +1603,77 @@ class SupabaseManager:
                     .execute()
                 )
                 if res.data:
-                    return res.data
+                    messages = [dict(m) for m in res.data]
             except Exception:
                 pass
-        return [
-            m
-            for m in self._local_tables["messages"]
-            if m.get("workspace_id") == workspace_id and m.get("conversation_id") == conversation_id
+
+        if not messages:
+            messages = [
+                dict(m)
+                for m in self._local_tables["messages"]
+                if m.get("workspace_id") == workspace_id and m.get("conversation_id") == conversation_id
+            ]
+
+        if not messages:
+            return []
+
+        asst_ids = [
+            str(m["id"])
+            for m in messages
+            if m.get("role") == "assistant" and m.get("id")
         ]
+        citations_by_msg: Dict[str, List[Dict[str, Any]]] = {}
+
+        if asst_ids:
+            raw_cits: List[Dict[str, Any]] = []
+            if self.is_connected:
+                try:
+                    cit_res = (
+                        self.client.table("message_citations")
+                        .select("*")
+                        .eq("workspace_id", workspace_id)
+                        .in_("message_id", asst_ids)
+                        .order("citation_index", desc=False)
+                        .execute()
+                    )
+                    if cit_res.data:
+                        raw_cits = list(cit_res.data)
+                except Exception:
+                    pass
+
+            if not raw_cits:
+                id_set = set(asst_ids)
+                raw_cits = [
+                    dict(c)
+                    for c in self._local_tables["message_citations"]
+                    if c.get("workspace_id") == workspace_id and str(c.get("message_id")) in id_set
+                ]
+                raw_cits.sort(key=lambda c: int(c.get("citation_index") or 1))
+
+            if raw_cits:
+                docs = self.list_workspace_documents(workspace_id)
+                title_by_doc = {str(d.get("id")): d.get("title") for d in docs if d.get("id")}
+                for c in raw_cits:
+                    mid = str(c.get("message_id") or "")
+                    did = str(c.get("doc_id") or c.get("document_id") or "")
+                    idx = int(c.get("citation_index") or (len(citations_by_msg.get(mid, [])) + 1))
+                    citations_by_msg.setdefault(mid, []).append(
+                        {
+                            "citation_id": f"cite_{idx}",
+                            "chunk_id": str(c.get("chunk_id") or ""),
+                            "document_id": did,
+                            "document_title": title_by_doc.get(did) or "Workspace Document",
+                            "page_number": int(c.get("page_number") or 1),
+                            "quote": str(c.get("verbatim_snippet") or c.get("quote") or ""),
+                            "bounding_boxes": c.get("bounding_boxes") or [],
+                        }
+                    )
+
+        for m in messages:
+            mid = str(m.get("id") or "")
+            m["citations"] = citations_by_msg.get(mid, [])
+
+        return messages
 
     # -------------------------------------------------------------------------
     # 7. Dashboard Widgets Persistence (Pillar B - DOC-14, DOC-15)

@@ -51,35 +51,7 @@ def _row_to_document_info(row: Dict[str, Any], is_duplicate: bool = False) -> Do
     )
 
 
-@router.get("", response_model=List[DocumentInfo])
-async def list_documents(
-    search: Optional[str] = Query(default=None),
-    status: Optional[str] = Query(default=None),
-    category: Optional[str] = Query(default=None),
-    tag: Optional[str] = Query(default=None),
-    has_tables: Optional[bool] = Query(default=None),
-    sort_by: str = Query(default="created_at"),
-    sort_dir: str = Query(default="desc"),
-    ctx: WorkspaceContext = Depends(get_verified_workspace_context),
-):
-    rows = supabase_db.list_workspace_documents(
-        ctx.workspace_id,
-        search=search,
-        status=status,
-        category=category,
-        tag=tag,
-        has_tables=has_tables,
-        sort_by=sort_by,
-        sort_dir=sort_dir,
-    )
-    return [_row_to_document_info(r) for r in rows]
-
-
-@router.get("/summary")
-async def get_repository_summary(
-    ctx: WorkspaceContext = Depends(get_verified_workspace_context),
-):
-    rows = supabase_db.list_workspace_documents(ctx.workspace_id)
+def _build_summary_from_rows(workspace_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_bytes = sum(int(r.get("file_size_bytes") or 0) for r in rows)
     categories: Dict[str, int] = {}
     tags_set: set[str] = set()
@@ -103,7 +75,7 @@ async def get_repository_summary(
                 tags_set.add(t)
 
     return {
-        "workspace_id": ctx.workspace_id,
+        "workspace_id": workspace_id,
         "total_documents": len(rows),
         "ready_count": ready_count,
         "processing_count": processing_count,
@@ -113,6 +85,66 @@ async def get_repository_summary(
         "categories": categories,
         "available_tags": sorted(tags_set)[:50],
     }
+
+
+@router.get("/bootstrap")
+async def get_workspace_bootstrap(
+    ctx: WorkspaceContext = Depends(get_verified_workspace_context),
+):
+    """
+    Single-roundtrip fast bootstrap endpoint for initial dashboard entry:
+    Resolves verified user, workspace identity, repository summary, and document list in one non-blocking call.
+    """
+    rows = await asyncio.to_thread(supabase_db.list_workspace_documents, ctx.workspace_id)
+    return {
+        "authenticated": True,
+        "user": {
+            "id": ctx.user_id,
+            "email": ctx.email,
+            "username": ctx.username,
+            "email_verified": ctx.email_verified,
+        },
+        "workspace": {
+            "id": ctx.workspace_id,
+            "name": ctx.workspace_name,
+            "role": ctx.role,
+        },
+        "summary": _build_summary_from_rows(ctx.workspace_id, rows),
+        "documents": [_row_to_document_info(r) for r in rows],
+    }
+
+
+@router.get("", response_model=List[DocumentInfo])
+async def list_documents(
+    search: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    category: Optional[str] = Query(default=None),
+    tag: Optional[str] = Query(default=None),
+    has_tables: Optional[bool] = Query(default=None),
+    sort_by: str = Query(default="created_at"),
+    sort_dir: str = Query(default="desc"),
+    ctx: WorkspaceContext = Depends(get_verified_workspace_context),
+):
+    rows = await asyncio.to_thread(
+        supabase_db.list_workspace_documents,
+        ctx.workspace_id,
+        search=search,
+        status=status,
+        category=category,
+        tag=tag,
+        has_tables=has_tables,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+    return [_row_to_document_info(r) for r in rows]
+
+
+@router.get("/summary")
+async def get_repository_summary(
+    ctx: WorkspaceContext = Depends(get_verified_workspace_context),
+):
+    rows = await asyncio.to_thread(supabase_db.list_workspace_documents, ctx.workspace_id)
+    return _build_summary_from_rows(ctx.workspace_id, rows)
 
 
 async def _read_upload_bounded(file: UploadFile, max_bytes: int) -> bytes:
@@ -231,14 +263,16 @@ async def get_document(
     document_id: str,
     ctx: WorkspaceContext = Depends(get_verified_workspace_context),
 ):
-    doc = supabase_db.get_workspace_document(ctx.workspace_id, document_id)
+    doc = await asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found in your workspace.")
 
     info = _row_to_document_info(doc)
-    tables = supabase_db.get_workspace_tables(ctx.workspace_id, doc_ids=[document_id])
-    metrics = supabase_db.get_workspace_metrics(ctx.workspace_id, doc_ids=[document_id])
-    latest_job = supabase_db.get_latest_job_for_document(ctx.workspace_id, document_id)
+    tables, metrics, latest_job = await asyncio.gather(
+        asyncio.to_thread(supabase_db.get_workspace_tables, ctx.workspace_id, doc_ids=[document_id]),
+        asyncio.to_thread(supabase_db.get_workspace_metrics, ctx.workspace_id, doc_ids=[document_id]),
+        asyncio.to_thread(supabase_db.get_latest_job_for_document, ctx.workspace_id, document_id),
+    )
 
     payload = info.model_dump()
     payload["extracted_tables"] = tables
@@ -252,10 +286,12 @@ async def get_document_processing_status(
     document_id: str,
     ctx: WorkspaceContext = Depends(get_verified_workspace_context),
 ):
-    doc = supabase_db.get_workspace_document(ctx.workspace_id, document_id)
+    doc, job = await asyncio.gather(
+        asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, document_id),
+        asyncio.to_thread(supabase_db.get_latest_job_for_document, ctx.workspace_id, document_id),
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found in your workspace.")
-    job = supabase_db.get_latest_job_for_document(ctx.workspace_id, document_id)
     return {
         "document_id": document_id,
         "status": doc.get("status") or doc.get("processing_status") or "queued",

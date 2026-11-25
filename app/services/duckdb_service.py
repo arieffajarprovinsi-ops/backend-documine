@@ -95,16 +95,32 @@ def _hydrate_records_into_duckdb(
 
     col_names = list(rows[0].keys())
     col_defs: List[str] = []
+    numeric_cols: set[str] = set()
     for col in col_names:
         sample_vals = [r.get(col) for r in rows if r.get(col) is not None]
-        if sample_vals and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in sample_vals):
+        if sample_vals and all(
+            isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and math.isfinite(float(v))
+            and abs(float(v)) < 1e100
+            for v in sample_vals
+        ):
             col_defs.append(f'"{col}" DOUBLE')
+            numeric_cols.add(col)
         else:
             col_defs.append(f'"{col}" VARCHAR')
 
+    def _safe_cell(col: str, val: Any) -> Any:
+        if val is None:
+            return None
+        if col in numeric_cols:
+            fval = float(val)
+            return fval if math.isfinite(fval) else None
+        return str(val)
+
     conn.execute(f'CREATE TABLE "{table_name}" ({", ".join(col_defs)});')
     placeholders = ", ".join(["?"] * len(col_names))
-    tuples_to_insert = [tuple(r.get(col) for col in col_names) for r in rows]
+    tuples_to_insert = [tuple(_safe_cell(col, r.get(col)) for col in col_names) for r in rows]
     conn.executemany(f'INSERT INTO "{table_name}" VALUES ({placeholders});', tuples_to_insert)
 
 
@@ -213,7 +229,7 @@ class WorkspaceDuckDBSandbox:
             self.conn = None
 
     def get_schema_context_prompt(self) -> str:
-        """Build a concise DESCRIBE + sample rows summary for gpt-6.1-sol SQL planning."""
+        """Build a concise DESCRIBE + sample rows summary for gpt-6.1-terra SQL planning."""
         if not self.conn:
             return "No active DuckDB connection."
         sections: List[str] = []

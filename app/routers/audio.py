@@ -5,28 +5,41 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from app.core.workspace import WorkspaceContext, get_verified_workspace_context
 from app.db.supabase_client import supabase_db
-from app.ai.contracts import AITaskType, AudioBriefingScriptPayload
+from app.ai.contracts import AITaskType, StorytellingScriptPayload
 from app.ai.gateway import ai_gateway, format_untrusted_chunk
 from app.core.config import settings
 
 router = APIRouter(prefix="/audio", tags=["audio"])
 
+SUPPORTED_STORY_VOICES = {
+    "marin",
+    "coral",
+    "sage",
+    "cedar",
+    "ash",
+    "ballad",
+    "shimmer",
+    "fable",
+}
 
-class PodcastDialogueTurn(BaseModel):
-    speaker: str = Field(description="Host name ('Alex' or 'Sarah')")
-    text: str = Field(description="Natural conversational dialogue grounded in the document")
+
+class StoryChapterTurn(BaseModel):
+    speaker: str = Field(description="Chapter label or narrator heading")
+    text: str = Field(description="Smooth single-narrator storytelling prose grounded in the document")
     source_chunk_id: Optional[str] = None
 
 
-class PodcastScriptResponse(BaseModel):
+class StorytellingScriptResponse(BaseModel):
     title: str
     duration_estimate: str
-    script: List[PodcastDialogueTurn]
+    script: List[StoryChapterTurn]
     takeaway_summary: str
+    style: str = "storytelling"
 
 
 class AudioBriefingRequest(BaseModel):
     document_id: Optional[str] = None
+    style: str = "storytelling"
 
 
 class SynthesizeSegmentInput(BaseModel):
@@ -38,6 +51,8 @@ class SynthesizeSegmentInput(BaseModel):
 class AudioSynthesizeRequest(BaseModel):
     document_id: Optional[str] = None
     title: Optional[str] = None
+    voice: str = "marin"
+    style: str = "storytelling"
     script: List[SynthesizeSegmentInput] = Field(min_length=1, max_length=8)
 
 
@@ -52,21 +67,26 @@ class SynthesizedAudioTurn(BaseModel):
 
 class AudioSynthesizeResponse(BaseModel):
     model_used: str
+    voice_used: str = "marin"
     fallback_browser_tts: bool = False
     segments: List[SynthesizedAudioTurn]
 
 
-@router.post("/briefing-script", response_model=PodcastScriptResponse)
-async def generate_podcast_briefing_script(
+@router.post("/briefing-script", response_model=StorytellingScriptResponse)
+async def generate_storytelling_script(
     document_id: Optional[str] = Query(default=None),
+    style: str = Query(default="storytelling"),
     body: Optional[AudioBriefingRequest] = Body(default=None),
     ctx: WorkspaceContext = Depends(get_verified_workspace_context),
 ):
     """
-    Studio 2-Host Audio Briefing Script Generator:
-    Produces natural conversational dialogue strictly grounded in the user's document.
+    Immersive Document Storytelling Generator (powered by fast gpt-6-luna):
+    Crafts a cohesive, engaging single-narrator story organized into clear chapters,
+    strictly grounded in the user's document in its native language.
     """
     target_doc_id = document_id or (body.document_id if body else None)
+    req_style = ((body.style if body and body.style else style) or "storytelling").strip().lower()
+
     if not target_doc_id:
         docs = await asyncio.to_thread(supabase_db.list_workspace_documents, ctx.workspace_id)
         if not docs:
@@ -90,117 +110,153 @@ async def generate_podcast_briefing_script(
     doc_title = doc.get("title", "Workspace Document")
     doc_summary = (doc.get("summary") or "").strip()
     doc_topics = doc.get("main_topics") or []
+    lang_code = (doc.get("language_code") or "id").lower()
     chunks = await asyncio.to_thread(supabase_db.get_document_chunks, ctx.workspace_id, target_doc_id)
+
+    style_guidance = {
+        "storytelling": (
+            "Write as an immersive, warm narrative story that draws the listener in from an intriguing opening hook "
+            "through the core journey, key figures/turning points, and a memorable closing takeaway."
+        ),
+        "documentary": (
+            "Write like a crisp, vivid documentary narrator guiding the listener clearly through the context, "
+            "verified facts, quantitative highlights, and real-world implications."
+        ),
+        "executive": (
+            "Write as a polished, cohesive single-voice narrative briefing connecting purpose, core evidence, "
+            "and strategic takeaways smoothly without bullet-point stiffness."
+        ),
+    }.get(req_style, "Write as an engaging, natural single-voice narrative story.")
 
     if ai_gateway.is_openai_configured and chunks:
         try:
+            max_samples = min(7, len(chunks))
+            if len(chunks) <= max_samples:
+                sampled = chunks
+            else:
+                step = (len(chunks) - 1) / float(max(1, max_samples - 1))
+                idxs = sorted({round(i * step) for i in range(max_samples)})
+                sampled = [chunks[i] for i in idxs if 0 <= i < len(chunks)]
+
             passages = "\n\n".join(
                 format_untrusted_chunk(
                     chunk_id=str(c["id"]),
-                    text_content=c.get("text_content") or c.get("content") or "",
+                    text_content=((c.get("text_content") or c.get("content") or "").strip())[:520],
                     page_number=int(c.get("page_number", 1)),
                     doc_title=doc_title,
                     doc_id=target_doc_id,
                 )
-                for c in chunks[:10]
+                for c in sampled
             )
             payload = await ai_gateway.generate_structured(
                 task_type=AITaskType.AUDIO_BRIEFING_SCRIPT,
                 workspace_id=ctx.workspace_id,
                 user_id=ctx.user_id,
                 instructions=(
-                    "You are the DocuMind Audio Briefing Scriptwriter. Create an engaging 4-to-6 turn conversational dialogue "
-                    "between 'Alex' (host) and 'Sarah' (analyst) summarizing the key findings, numbers, and implications "
-                    "of the document passages. Match the primary language of the document (English or Indonesian), keep each "
-                    "turn concise (2-3 crisp spoken sentences), and populate source_chunk_id."
+                    "You are the DocuMind Master Storyteller. Transform the provided document passages into a "
+                    "captivating 3-to-4 chapter single-narrator audio story (NOT a two-person Q&A podcast). "
+                    f"{style_guidance} "
+                    "Use the exact primary language of the document (natural Indonesian if Indonesian, English if English). "
+                    "Write smooth spoken sentences free of raw markdown symbols or citation brackets so it sounds "
+                    "completely human when read aloud, and attach source_chunk_id for each chapter."
                 ),
                 input_blocks=f"Document Title: {doc_title}\nExecutive Summary: {doc_summary}\n\n{passages}",
-                response_model=AudioBriefingScriptPayload,
-                scope_key=f"audio:{target_doc_id}",
+                response_model=StorytellingScriptPayload,
+                scope_key=f"story:{target_doc_id}:{req_style}",
             )
             mins = max(1, payload.duration_estimate_seconds // 60)
             secs = payload.duration_estimate_seconds % 60
-            return PodcastScriptResponse(
-                title=payload.title or f"Audio Briefing: {doc_title}",
+            return StorytellingScriptResponse(
+                title=payload.title or doc_title,
                 duration_estimate=f"{mins:02d}:{secs:02d}",
                 script=[
-                    PodcastDialogueTurn(
-                        speaker="Alex" if ("alex" in seg.speaker.lower() or "host" in seg.speaker.lower()) else "Sarah",
-                        text=seg.text,
-                        source_chunk_id=seg.source_chunk_id,
+                    StoryChapterTurn(
+                        speaker=ch.chapter_title or f"Chapter {idx + 1}",
+                        text=ch.narration,
+                        source_chunk_id=ch.source_chunk_id,
                     )
-                    for seg in payload.dialogue
+                    for idx, ch in enumerate(payload.chapters[:5])
+                    if (ch.narration or "").strip()
                 ],
-                takeaway_summary=doc_summary or f"Key takeaways synthesized from {doc_title}.",
+                takeaway_summary=payload.takeaway_summary or doc_summary or f"Core story from {doc_title}.",
+                style=req_style,
             )
         except Exception as e:
-            print(f"[AudioRouter] OpenAI briefing fallback notice: {e}")
+            print(f"[AudioRouter] OpenAI storytelling fallback notice: {e}")
 
     first_chunk_text = (
-        " ".join((chunks[0].get("text_content") or chunks[0].get("content") or "").split())[:240]
+        " ".join((chunks[0].get("text_content") or chunks[0].get("content") or "").split())[:280]
         if chunks
-        else doc_summary[:240]
+        else doc_summary[:280]
     )
     second_chunk_text = (
-        " ".join((chunks[1].get("text_content") or chunks[1].get("content") or "").split())[:240]
+        " ".join((chunks[1].get("text_content") or chunks[1].get("content") or "").split())[:280]
         if len(chunks) > 1
         else first_chunk_text
     )
     first_cid = str(chunks[0]["id"]) if chunks else None
     second_cid = str(chunks[1]["id"]) if len(chunks) > 1 else first_cid
-    topics_label = ", ".join(doc_topics[:4]) if doc_topics else (doc.get("primary_domain") or "core findings")
+    topics_label = ", ".join(doc_topics[:4]) if doc_topics else (doc.get("primary_domain") or "topik utama")
 
-    return PodcastScriptResponse(
-        title=f"Audio Briefing: {doc_title}",
-        duration_estimate="01:15",
-        script=[
-            PodcastDialogueTurn(
-                speaker="Alex",
-                text=f"Welcome to DocuMind Audio Briefing. Today we are reviewing {doc_title}. What is the main takeaway?",
+    if lang_code == "id":
+        fallback_chapters = [
+            StoryChapterTurn(
+                speaker="Babak 1 · Konteks Cerita",
+                text=f"Mari kita telusuri isi dari {doc_title}. Dokumen ini mengangkat fokus utama seputar {topics_label}. {doc_summary or first_chunk_text}",
                 source_chunk_id=first_cid,
             ),
-            PodcastDialogueTurn(
-                speaker="Sarah",
-                text=(
-                    f"This document covers {topics_label}. "
-                    f"Here is the core overview: {doc_summary or first_chunk_text}"
-                ),
+            StoryChapterTurn(
+                speaker="Babak 2 · Detail & Bukti Penting",
+                text=f"Memasuki bagian inti dokumen, tercatat detail penting berikut: {second_chunk_text}",
+                source_chunk_id=second_cid,
+            ),
+        ]
+    else:
+        fallback_chapters = [
+            StoryChapterTurn(
+                speaker="Chapter 1 · Opening Context",
+                text=f"Let us explore the story inside {doc_title}, which centers around {topics_label}. {doc_summary or first_chunk_text}",
                 source_chunk_id=first_cid,
             ),
-            PodcastDialogueTurn(
-                speaker="Alex",
-                text="Are there specific details or evidence readers should pay attention to?",
+            StoryChapterTurn(
+                speaker="Chapter 2 · Core Evidence",
+                text=f"Looking closer at the key passages, the document highlights: {second_chunk_text}",
                 source_chunk_id=second_cid,
             ),
-            PodcastDialogueTurn(
-                speaker="Sarah",
-                text=f"Yes, the source passages highlight this point directly: {second_chunk_text}",
-                source_chunk_id=second_cid,
-            ),
-        ],
-        takeaway_summary=doc_summary or first_chunk_text or f"Grounded summary of {doc_title}.",
+        ]
+
+    return StorytellingScriptResponse(
+        title=doc_title,
+        duration_estimate="01:20",
+        script=fallback_chapters,
+        takeaway_summary=doc_summary or first_chunk_text or f"Narrative overview of {doc_title}.",
+        style=req_style,
     )
 
 
 @router.post("/synthesize", response_model=AudioSynthesizeResponse)
-async def synthesize_podcast_audio(
+async def synthesize_storytelling_audio(
     req: AudioSynthesizeRequest,
     ctx: WorkspaceContext = Depends(get_verified_workspace_context),
 ):
     """
-    Generate spoken MP3 audio segments using OpenAI's cost-effective 2026 TTS model
-    (`gpt-4o-mini-tts` with automatic `tts-1` fallback). Returns `fallback_browser_tts=True`
-    if OpenAI TTS is unavailable so the UI seamlessly plays with browser speech synthesis.
+    Synthesize cohesive single-narrator Storytelling audio chapters using OpenAI's natural voices
+    (`marin`, `coral`, `sage`, `cedar`, `ash`, `ballad`, `shimmer`) over HD TTS (`tts-1-hd` / `gpt-4o-mini-tts`).
     """
     turns = req.script[:6]
+    chosen_voice = (req.voice or getattr(settings, "openai_tts_default_voice", "marin") or "marin").strip().lower()
+    if chosen_voice not in SUPPORTED_STORY_VOICES:
+        chosen_voice = "marin"
+
     if not ai_gateway.is_openai_configured:
         return AudioSynthesizeResponse(
             model_used="browser-speech",
+            voice_used=chosen_voice,
             fallback_browser_tts=True,
             segments=[
                 SynthesizedAudioTurn(
                     speaker=t.speaker,
-                    voice="onyx" if "alex" in t.speaker.lower() else "nova",
+                    voice=chosen_voice,
                     text=t.text,
                     audio_base64=None,
                     source_chunk_id=t.source_chunk_id,
@@ -210,29 +266,25 @@ async def synthesize_podcast_audio(
         )
 
     model_used = settings.openai_tts_model
-    segments_out: List[SynthesizedAudioTurn] = []
+    tone_instruction = (
+        "Narrate smoothly, warmly, and naturally like a captivating human audiobook storyteller, "
+        "matching the exact native pronunciation of the text without rushing."
+    )
 
-    async def _synth_turn(turn: SynthesizeSegmentInput) -> SynthesizedAudioTurn:
-        is_alex = "alex" in turn.speaker.lower() or "host" in turn.speaker.lower()
-        voice = "onyx" if is_alex else "nova"
-        tone_hint = (
-            "Speak naturally in a warm, clear podcast host tone."
-            if is_alex
-            else "Speak naturally in an articulate, insightful co-host analyst tone."
-        )
+    async def _synth_chapter(turn: SynthesizeSegmentInput) -> SynthesizedAudioTurn:
         audio_bytes, usage_meta = await ai_gateway.generate_speech(
             text=turn.text,
             workspace_id=ctx.workspace_id,
             user_id=ctx.user_id,
-            voice=voice,
-            instructions=tone_hint,
+            voice=chosen_voice,
+            instructions=tone_instruction,
         )
         nonlocal model_used
         model_used = str(usage_meta.get("model") or model_used)
         b64 = base64.b64encode(audio_bytes).decode("ascii")
         return SynthesizedAudioTurn(
-            speaker="Alex" if is_alex else "Sarah",
-            voice=voice,
+            speaker=turn.speaker,
+            voice=chosen_voice,
             text=turn.text,
             audio_base64=b64,
             content_type="audio/mpeg",
@@ -240,22 +292,23 @@ async def synthesize_podcast_audio(
         )
 
     try:
-        results = await asyncio.gather(*(_synth_turn(t) for t in turns))
-        segments_out = list(results)
+        results = await asyncio.gather(*(_synth_chapter(t) for t in turns))
         return AudioSynthesizeResponse(
             model_used=model_used,
+            voice_used=chosen_voice,
             fallback_browser_tts=False,
-            segments=segments_out,
+            segments=list(results),
         )
     except Exception as exc:
         print(f"[AudioRouter] OpenAI TTS fallback to browser speech: {exc}")
         return AudioSynthesizeResponse(
             model_used="browser-speech",
+            voice_used=chosen_voice,
             fallback_browser_tts=True,
             segments=[
                 SynthesizedAudioTurn(
                     speaker=t.speaker,
-                    voice="onyx" if "alex" in t.speaker.lower() else "nova",
+                    voice=chosen_voice,
                     text=t.text,
                     audio_base64=None,
                     source_chunk_id=t.source_chunk_id,

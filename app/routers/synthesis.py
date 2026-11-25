@@ -1,3 +1,4 @@
+import asyncio
 import re
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -7,6 +8,7 @@ from app.db.supabase_client import supabase_db
 from app.ai.contracts import (
     AITaskType,
     CrossDocumentSynthesisResponse,
+    DocumentFindingEntry,
     SynthesisComparisonRow,
     ContradictionAlertItem,
 )
@@ -77,6 +79,12 @@ class SynthesisItem(BaseModel):
     is_contradiction: bool = Field(default=False)
 
 
+class SynthesisComparisonRowOut(BaseModel):
+    dimension_name: str
+    per_document_findings: Dict[str, str] = Field(default_factory=dict)
+    consensus_or_divergence: str
+
+
 class SynthesisMatrixResponse(BaseModel):
     title: str
     synthesis_headline: str
@@ -85,7 +93,7 @@ class SynthesisMatrixResponse(BaseModel):
     executive_synthesis: str
     key_agreements: List[str] = Field(default_factory=list)
     matrix: List[SynthesisItem] = Field(default_factory=list)
-    comparison_matrix: List[SynthesisComparisonRow] = Field(default_factory=list)
+    comparison_matrix: List[SynthesisComparisonRowOut] = Field(default_factory=list)
     contradiction_alerts: List[ContradictionAlertItem] = Field(default_factory=list)
     emergent_takeaways: List[str] = Field(default_factory=list)
     citations: List[ChatCitation] = Field(default_factory=list)
@@ -94,8 +102,8 @@ class SynthesisMatrixResponse(BaseModel):
 class SynthesisRequest(BaseModel):
     document_ids: List[str] = Field(
         min_length=2,
-        max_length=10,
-        description="Between 2 and 10 workspace document IDs to compare",
+        max_length=12,
+        description="Between 2 and 12 workspace document IDs to compare",
     )
     focus_query: Optional[str] = Field(
         default=None,
@@ -174,17 +182,20 @@ def _deterministic_cross_doc_synthesis(
         )
     )
 
+    def _dict_to_entries(d_map: Dict[str, str]) -> List[DocumentFindingEntry]:
+        return [DocumentFindingEntry(doc_id=k, finding=v) for k, v in d_map.items()]
+
     comparison_rows: List[SynthesisComparisonRow] = [
         SynthesisComparisonRow(
             dimension_name="Executive Scope & Purpose",
-            per_document_findings=scope_findings,
+            findings_list=_dict_to_entries(scope_findings),
             consensus_or_divergence=(
                 f"{overlap_note} {('Focused on: ' + focus_query) if focus_query else ''}".strip()
             ),
         ),
         SynthesisComparisonRow(
             dimension_name="Schedule, Period & Document Structure",
-            per_document_findings=time_findings,
+            findings_list=_dict_to_entries(time_findings),
             consensus_or_divergence=(
                 f"Common timeline/context terms ({', '.join(common_terms[:4])}) align across the compared files."
                 if common_terms
@@ -193,7 +204,7 @@ def _deterministic_cross_doc_synthesis(
         ),
         SynthesisComparisonRow(
             dimension_name="Thematic & Conceptual Focus",
-            per_document_findings=topic_findings,
+            findings_list=_dict_to_entries(topic_findings),
             consensus_or_divergence=(
                 f"Shared topics: {', '.join(common_topics[:5])}."
                 if common_topics
@@ -223,42 +234,48 @@ def _deterministic_cross_doc_synthesis(
             metric_findings[did] = f"Narrative/procedural content ({len(d_chunks)} indexed passages, 0 extracted numeric KPIs){cite_tag}"
 
     if len(docs) >= 2:
-        d0, d1 = docs[0], docs[1]
-        id0, id1 = str(d0["id"]), str(d1["id"])
-        m_list0, m_list1 = metrics_by_doc.get(id0, []), metrics_by_doc.get(id1, [])
-        for m0 in m_list0:
-            for m1 in m_list1:
-                val0 = float(m0.get("numeric_value", 0.0))
-                val1 = float(m1.get("numeric_value", 0.0))
-                u0 = (m0.get("unit_or_currency") or "").strip().upper()
-                u1 = (m1.get("unit_or_currency") or "").strip().upper()
-                if val0 != val1 and (u0 == u1 or m0.get("metric_name") == m1.get("metric_name")):
-                    c0 = str(m0.get("source_chunk_id") or (chunks_by_doc[id0][0]["id"] if chunks_by_doc.get(id0) else ""))
-                    c1 = str(m1.get("source_chunk_id") or (chunks_by_doc[id1][0]["id"] if chunks_by_doc.get(id1) else ""))
-                    contradictions.append(
-                        ContradictionAlertItem(
-                            topic_or_metric=str(m0.get("metric_name") or u0 or "Quantitative Metric"),
-                            doc_a_id=id0,
-                            doc_a_claim=f"{m0.get('metric_name')}: {val0} {u0}",
-                            doc_a_chunk_id=c0,
-                            doc_b_id=id1,
-                            doc_b_claim=f"{m1.get('metric_name')}: {val1} {u1}",
-                            doc_b_chunk_id=c1,
-                            severity="medium",
-                            explanation=(
-                                f"{d0.get('title')} reports {val0} {u0} whereas {d1.get('title')} reports {val1} {u1}."
-                            ),
-                        )
-                    )
+        for i_idx in range(len(docs)):
+            for j_idx in range(i_idx + 1, len(docs)):
+                d0, d1 = docs[i_idx], docs[j_idx]
+                id0, id1 = str(d0["id"]), str(d1["id"])
+                m_list0, m_list1 = metrics_by_doc.get(id0, []), metrics_by_doc.get(id1, [])
+                for m0 in m_list0:
+                    for m1 in m_list1:
+                        val0 = float(m0.get("numeric_value", 0.0))
+                        val1 = float(m1.get("numeric_value", 0.0))
+                        u0 = (m0.get("unit_or_currency") or "").strip().upper()
+                        u1 = (m1.get("unit_or_currency") or "").strip().upper()
+                        if val0 != val1 and (u0 == u1 or m0.get("metric_name") == m1.get("metric_name")):
+                            c0 = str(m0.get("source_chunk_id") or (chunks_by_doc[id0][0]["id"] if chunks_by_doc.get(id0) else ""))
+                            c1 = str(m1.get("source_chunk_id") or (chunks_by_doc[id1][0]["id"] if chunks_by_doc.get(id1) else ""))
+                            contradictions.append(
+                                ContradictionAlertItem(
+                                    topic_or_metric=str(m0.get("metric_name") or u0 or "Quantitative Metric"),
+                                    doc_a_id=id0,
+                                    doc_a_claim=f"{m0.get('metric_name')}: {val0} {u0}",
+                                    doc_a_chunk_id=c0,
+                                    doc_b_id=id1,
+                                    doc_b_claim=f"{m1.get('metric_name')}: {val1} {u1}",
+                                    doc_b_chunk_id=c1,
+                                    severity="medium",
+                                    explanation=(
+                                        f"{d0.get('title')} reports {val0} {u0} whereas {d1.get('title')} reports {val1} {u1}."
+                                    ),
+                                )
+                            )
+                            break
+                    if len(contradictions) >= 4:
+                        break
+                if len(contradictions) >= 4:
                     break
-            if contradictions:
+            if len(contradictions) >= 4:
                 break
 
     has_any_metrics = any(bool(metrics_by_doc.get(str(d["id"]))) for d in docs)
     comparison_rows.append(
         SynthesisComparisonRow(
             dimension_name="Quantitative Indicators & Metrics",
-            per_document_findings=metric_findings,
+            findings_list=_dict_to_entries(metric_findings),
             consensus_or_divergence=(
                 contradictions[0].explanation
                 if contradictions
@@ -314,8 +331,18 @@ async def _execute_cross_doc_synthesis(
     metrics_by_doc: Dict[str, List[Dict[str, Any]]] = {}
     all_candidate_chunks: List[Dict[str, Any]] = []
 
-    for doc_id in request.document_ids:
-        doc = supabase_db.get_workspace_document(ctx.workspace_id, doc_id)
+    async def _fetch_one_doc(doc_id: str):
+        doc, doc_chunks, doc_metrics = await asyncio.gather(
+            asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, doc_id),
+            asyncio.to_thread(supabase_db.get_document_chunks, ctx.workspace_id, doc_id),
+            asyncio.to_thread(supabase_db.get_workspace_metrics, ctx.workspace_id, doc_ids=[doc_id]),
+        )
+        return doc_id, doc, doc_chunks, doc_metrics
+
+    fetched_items = await asyncio.gather(*[_fetch_one_doc(did) for did in request.document_ids])
+    per_doc_chunk_cap = max(2, min(6, 24 // max(2, len(request.document_ids))))
+
+    for doc_id, doc, doc_chunks, doc_metrics in fetched_items:
         if not doc:
             raise HTTPException(
                 status_code=404,
@@ -325,13 +352,12 @@ async def _execute_cross_doc_synthesis(
                 },
             )
         docs.append(doc)
-        doc_chunks = supabase_db.get_document_chunks(ctx.workspace_id, doc_id)
         for c in doc_chunks:
             c["doc_id"] = doc_id
             c["doc_title"] = doc.get("title", "Document")
         chunks_by_doc[doc_id] = doc_chunks
-        all_candidate_chunks.extend(doc_chunks[:6])
-        metrics_by_doc[doc_id] = supabase_db.get_workspace_metrics(ctx.workspace_id, doc_ids=[doc_id])
+        all_candidate_chunks.extend(doc_chunks[:per_doc_chunk_cap])
+        metrics_by_doc[doc_id] = doc_metrics
 
     chunks_by_id = {str(c["id"]): c for c in all_candidate_chunks if c.get("id")}
     synthesis_result: Optional[CrossDocumentSynthesisResponse] = None
@@ -392,8 +418,8 @@ async def _execute_cross_doc_synthesis(
 
     combined_citation_text = synthesis_result.executive_synthesis
     for row in synthesis_result.comparison_matrix:
-        for finding in row.per_document_findings.values():
-            combined_citation_text += f" {finding}"
+        for entry in row.findings_list:
+            combined_citation_text += f" {entry.finding}"
 
     _, resolved_citations = citation_resolver.resolve_answer_citations(
         raw_answer=combined_citation_text,
@@ -402,14 +428,14 @@ async def _execute_cross_doc_synthesis(
 
     # Humanize all `[cite:UUID]` tokens across rendered fields so raw UUIDs never appear
     clean_exec = _humanize_citations(synthesis_result.executive_synthesis, chunks_by_id)
-    cleaned_rows: List[SynthesisComparisonRow] = []
+    cleaned_rows: List[SynthesisComparisonRowOut] = []
     for row in synthesis_result.comparison_matrix:
         cleaned_findings = {
-            k: _humanize_citations(v, chunks_by_id)
-            for k, v in row.per_document_findings.items()
+            entry.doc_id: _humanize_citations(entry.finding, chunks_by_id)
+            for entry in row.findings_list
         }
         cleaned_rows.append(
-            SynthesisComparisonRow(
+            SynthesisComparisonRowOut(
                 dimension_name=row.dimension_name,
                 per_document_findings=cleaned_findings,
                 consensus_or_divergence=_humanize_citations(row.consensus_or_divergence, chunks_by_id),

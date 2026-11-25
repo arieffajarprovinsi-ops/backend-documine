@@ -78,15 +78,17 @@ class Stage1FoundationTests(unittest.TestCase):
         self.assertFalse(doc_policy.store)
 
         chat_policy = ai_gateway.get_route_policy(AITaskType.GROUNDED_CHAT_STANDARD)
-        self.assertEqual(chat_policy.primary_model, "gpt-6.1-terra")
+        self.assertEqual(chat_policy.primary_model, "gpt-6-luna")
         self.assertFalse(chat_policy.store)
 
         sql_policy = ai_gateway.get_route_policy(AITaskType.DASHBOARD_SQL_PLANNING)
-        self.assertEqual(sql_policy.primary_model, "gpt-6.1-sol")
+        self.assertEqual(sql_policy.primary_model, "gpt-6.1-terra")
+        self.assertNotEqual(sql_policy.primary_model, "gpt-6.1-sol")
         self.assertFalse(sql_policy.store)
 
         synth_policy = ai_gateway.get_route_policy(AITaskType.CROSS_DOC_SYNTHESIS)
-        self.assertEqual(synth_policy.primary_model, "gpt-6.1-sol")
+        self.assertEqual(synth_policy.primary_model, "gpt-6-luna")
+        self.assertNotEqual(synth_policy.primary_model, "gpt-6.1-sol")
         self.assertFalse(synth_policy.store)
 
     def test_embeddings_and_usage_telemetry_scoping(self):

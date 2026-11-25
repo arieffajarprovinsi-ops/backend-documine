@@ -1,9 +1,11 @@
+import asyncio
 from typing import Optional, List, Dict, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from pydantic import BaseModel
 
 from app.ai.contracts import AITaskType, DashboardGenerationPlan
 from app.ai.gateway import ai_gateway
+from app.core.hardening import analytics_report_cache
 from app.core.workspace import WorkspaceContext, get_verified_workspace_context
 from app.db.supabase_client import supabase_db
 from app.models.schemas import DashboardWidget, EChartsOption
@@ -196,59 +198,71 @@ async def get_personalized_dashboard(
 ):
     """
     Pillar B: Personalized Adaptive Dashboard Home (DOC-14, PR-033..PR-039).
-    Adapts automatically to Corpus Profiles 0-3 (empty, quantitative, mixed, qualitative).
+    Parallelized off the event loop and cached cleanly per workspace.
     """
-    docs = supabase_db.list_workspace_documents(ctx.workspace_id)
-    tables = supabase_db.get_workspace_tables(ctx.workspace_id)
-    metrics = supabase_db.get_workspace_metrics(ctx.workspace_id)
-    relationships = supabase_db.list_workspace_relationships(ctx.workspace_id)
+    cache_key = f"an:{ctx.workspace_id}:dashboard_home"
+    cached = analytics_report_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    docs, tables, metrics, relationships, saved_widgets = await asyncio.gather(
+        asyncio.to_thread(supabase_db.list_workspace_documents, ctx.workspace_id),
+        asyncio.to_thread(supabase_db.get_workspace_tables, ctx.workspace_id),
+        asyncio.to_thread(supabase_db.get_workspace_metrics, ctx.workspace_id),
+        asyncio.to_thread(supabase_db.list_workspace_relationships, ctx.workspace_id),
+        asyncio.to_thread(supabase_db.list_dashboard_widgets, ctx.workspace_id),
+    )
 
     profile = _detect_corpus_profile(docs, tables, metrics)
-    saved_widgets = supabase_db.list_dashboard_widgets(ctx.workspace_id)
 
     auto_widgets: List[Dict[str, Any]] = []
     if docs:
         auto_widgets.append(_build_corpus_intelligence_widget(docs, ctx.workspace_id).model_dump())
 
+    def _run_duckdb_quant() -> Optional[Dict[str, Any]]:
+        with WorkspaceDuckDBSandbox(ctx.workspace_id, tables, metrics) as sandbox:
+            sql, x_col, y_col, unit_label = _build_default_quantitative_sql(sandbox, tables, metrics)
+            exec_res = sandbox.execute_validated_query(sql)
+            rows = exec_res["rows"]
+            if not rows:
+                return None
+            x_vals = [str(r.get(x_col, "")) for r in rows]
+            y_vals = [float(r.get(y_col) or 0.0) for r in rows]
+            return DashboardWidget(
+                id="widget_auto_quantitative",
+                workspace_id=ctx.workspace_id,
+                title=f"Verified Metrics Overview ({unit_label})",
+                subtitle="Computed deterministically via DuckDB from your documents",
+                description=f"Showing {len(rows)} verified metrics in {unit_label}.",
+                widget_type="echarts_chart" if len(rows) >= 2 else "kpi_card_group",
+                chart_type="bar" if len(rows) >= 2 else "kpi",
+                unit_or_currency=unit_label,
+                sql_query=exec_res["sql_query"],
+                echarts_spec=EChartsOption(
+                    title={"text": f"Metrics ({unit_label})", "left": "center"},
+                    tooltip={"trigger": "axis"},
+                    dataset={"source": rows},
+                    xAxis={"type": "category", "data": x_vals},
+                    yAxis={"type": "value", "name": unit_label},
+                    series=[{"name": unit_label, "type": "bar", "data": y_vals}],
+                ),
+                kpi_payload={"rows": rows, "unit": unit_label},
+                insight_summary=(
+                    f"Peak value recorded at '{x_vals[0]}' with {y_vals[0]} {unit_label}."
+                ),
+                source_doc_ids=sorted({str(m.get("doc_id")) for m in metrics if m.get("doc_id")})
+                or [str(d["id"]) for d in docs[:3]],
+            ).model_dump()
+
     if tables or len(metrics) >= 1:
         try:
-            with WorkspaceDuckDBSandbox(ctx.workspace_id, tables, metrics) as sandbox:
-                sql, x_col, y_col, unit_label = _build_default_quantitative_sql(sandbox, tables, metrics)
-                exec_res = sandbox.execute_validated_query(sql)
-                rows = exec_res["rows"]
-                if rows:
-                    x_vals = [str(r.get(x_col, "")) for r in rows]
-                    y_vals = [float(r.get(y_col) or 0.0) for r in rows]
-                    quant_widget = DashboardWidget(
-                        id="widget_auto_quantitative",
-                        workspace_id=ctx.workspace_id,
-                        title=f"Verified Metrics Overview ({unit_label})",
-                        subtitle="Computed deterministically via DuckDB from your documents",
-                        description=f"Showing {len(rows)} verified metrics in {unit_label}.",
-                        widget_type="echarts_chart" if len(rows) >= 2 else "kpi_card_group",
-                        chart_type="bar" if len(rows) >= 2 else "kpi",
-                        unit_or_currency=unit_label,
-                        sql_query=exec_res["sql_query"],
-                        echarts_spec=EChartsOption(
-                            title={"text": f"Metrics ({unit_label})", "left": "center"},
-                            tooltip={"trigger": "axis"},
-                            dataset={"source": rows},
-                            xAxis={"type": "category", "data": x_vals},
-                            yAxis={"type": "value", "name": unit_label},
-                            series=[{"name": unit_label, "type": "bar", "data": y_vals}],
-                        ),
-                        kpi_payload={"rows": rows, "unit": unit_label},
-                        insight_summary=(
-                            f"Peak value recorded at '{x_vals[0]}' with {y_vals[0]} {unit_label}."
-                        ),
-                        source_doc_ids=sorted({str(m.get("doc_id")) for m in metrics if m.get("doc_id")})
-                        or [str(d["id"]) for d in docs[:3]],
-                    )
-                    auto_widgets.insert(0, quant_widget.model_dump())
+            quant_dump = await asyncio.to_thread(_run_duckdb_quant)
+            if quant_dump:
+                auto_widgets.insert(0, quant_dump)
         except Exception as e:
             print(f"[Dashboard] Auto quantitative widget notice: {e}")
 
-    return {
+    result = {
         "workspace_id": ctx.workspace_id,
         "detected_corpus_profile": profile,
         "corpus_profile": profile,
@@ -263,6 +277,8 @@ async def get_personalized_dashboard(
         "saved_widgets": saved_widgets,
         "widgets": auto_widgets + saved_widgets,
     }
+    analytics_report_cache.set(cache_key, result, ttl_seconds=45.0)
+    return result
 
 
 @router.post("/generate-dashboard", response_model=DashboardWidget)
@@ -278,7 +294,7 @@ async def generate_dynamic_dashboard(
 ):
     """
     Stage A-D Personalized Dashboard Widget Generator (DOC-15, ADR-008, ADR-011, ADR-012).
-    Uses gpt-6.1-sol to plan read-only DuckDB SQL and ECharts spec, then executes and validates
+    Uses gpt-6.1-terra to plan read-only DuckDB SQL and ECharts spec, then executes and validates
     deterministically via the 5-Gate WorkspaceDuckDBSandbox.
     """
     if body:
@@ -334,7 +350,7 @@ async def generate_dynamic_dashboard(
                     workspace_id=ctx.workspace_id,
                     user_id=ctx.user_id,
                     instructions=(
-                        "You are the DocuMind Analytical SQL Planner (gpt-6.1-sol). Given the available DuckDB "
+                        "You are the DocuMind Analytical SQL Planner. Given the available DuckDB "
                         "table schemas and sample rows, output a read-only SELECT query that answers the user's "
                         "analytical request. NEVER mix incompatible units or currencies in a single SUM/AVG without "
                         "filtering or grouping by unit_or_currency. Do NOT output hardcoded data arrays."
@@ -371,7 +387,7 @@ async def generate_dynamic_dashboard(
                     if not explicit_chart_requested:
                         chosen_chart_type = first_s.type
             except Exception as plan_err:
-                print(f"[Analytics] gpt-6.1-sol planner fallback to deterministic SQL: {plan_err}")
+                print(f"[Analytics] SQL planner fallback to deterministic SQL: {plan_err}")
 
         if not planned_sql:
             planned_sql, x_col, y_col, unit_label = _build_default_quantitative_sql(sandbox, tables, metrics)

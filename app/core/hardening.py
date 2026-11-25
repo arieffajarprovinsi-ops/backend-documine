@@ -87,7 +87,9 @@ class TTLCache:
 
 
 # Shared caches across backend services
-token_verification_cache = TTLCache(max_entries=512, default_ttl_seconds=60.0)
+token_verification_cache = TTLCache(max_entries=512, default_ttl_seconds=90.0)
+workspace_context_cache = TTLCache(max_entries=512, default_ttl_seconds=120.0)
+workspace_docs_cache = TTLCache(max_entries=256, default_ttl_seconds=8.0)
 analytics_report_cache = TTLCache(max_entries=192, default_ttl_seconds=180.0)
 workspace_spend_cache = TTLCache(max_entries=256, default_ttl_seconds=30.0)
 
@@ -166,20 +168,21 @@ def _resolve_rate_tier(method: str, path: str) -> Tuple[str, int, int]:
     """Return (tier_name, max_requests, window_seconds) for a route."""
     p = path.lower()
     if p.startswith("/api/documents/upload") or p.endswith("/reprocess"):
-        return ("upload", 15, 60)
+        return ("upload", 60, 60)
     if (
         p.startswith("/api/chat")
         or p.startswith("/api/analytics/build-report")
         or p.startswith("/api/analytics/generate")
         or p.startswith("/api/synthesis")
         or p.startswith("/api/audio")
+        or p.startswith("/api/relationships/ai-connect")
     ):
-        return ("ai_heavy", 35, 60)
+        return ("ai_heavy", 60, 60)
     if p.startswith("/api/auth"):
-        return ("auth", 60, 60)
+        return ("auth", 90, 60)
     if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
-        return ("write", 90, 60)
-    return ("read", 240, 60)
+        return ("write", 120, 60)
+    return ("read", 600, 60)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

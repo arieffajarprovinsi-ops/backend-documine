@@ -54,10 +54,21 @@ OPENAI_PRICING_PER_1M: Dict[str, Dict[str, float]] = {
         "input_auto": 0.60,
         "output_auto": 12.00,
     },
+    "tts-1-hd": {
+        "input_auto": 30.00,
+    },
     "tts-1": {
         "input_auto": 15.00,
     },
 }
+
+
+def _guard_no_sol_model(model: str) -> str:
+    """Hard safety guard: never allow expensive gpt-6.1-sol even if overridden in environment variables."""
+    cleaned = (model or "").strip()
+    if not cleaned or "sol" in cleaned.lower():
+        return "gpt-6-luna"
+    return cleaned
 
 
 def calculate_openai_cost_usd(
@@ -206,6 +217,7 @@ class OpenAIProviderAdapter:
         if not self.is_configured:
             raise RuntimeError("OPENAI_API_KEY is not configured.")
 
+        model = _guard_no_sol_model(model)
         t0 = time.perf_counter()
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -241,6 +253,7 @@ class OpenAIProviderAdapter:
         if not self.is_configured:
             raise RuntimeError("OPENAI_API_KEY is not configured.")
 
+        model = _guard_no_sol_model(model)
         t0 = time.perf_counter()
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -274,6 +287,7 @@ class OpenAIProviderAdapter:
         if not self.is_configured:
             raise RuntimeError("OPENAI_API_KEY is not configured.")
 
+        model = _guard_no_sol_model(model)
         t0 = time.perf_counter()
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -349,17 +363,49 @@ class OpenAIProviderAdapter:
         total_tokens = 0
         batch_size = 256
 
-        for idx in range(0, len(sanitized), batch_size):
-            batch = sanitized[idx : idx + batch_size]
-            resp = await self._get_client().embeddings.create(
-                model=model,
-                input=batch,
-                dimensions=dimensions,
-            )
-            for item in resp.data:
-                all_vectors.append(list(item.embedding))
-            if getattr(resp, "usage", None):
-                total_tokens += int(getattr(resp.usage, "prompt_tokens", 0) or getattr(resp.usage, "total_tokens", 0) or 0)
+        try:
+            for idx in range(0, len(sanitized), batch_size):
+                batch = sanitized[idx : idx + batch_size]
+                try:
+                    resp = await self._get_client().embeddings.create(
+                        model=model,
+                        input=batch,
+                        dimensions=dimensions,
+                    )
+                except Exception as transient_err:
+                    err_str = str(transient_err).lower()
+                    if "429" in err_str or "rate" in err_str or "timeout" in err_str:
+                        await asyncio.sleep(1.2)
+                        resp = await self._get_client().embeddings.create(
+                            model=model,
+                            input=batch,
+                            dimensions=dimensions,
+                        )
+                    else:
+                        raise
+                for item in resp.data:
+                    all_vectors.append(list(item.embedding))
+                if getattr(resp, "usage", None):
+                    total_tokens += int(
+                        getattr(resp.usage, "prompt_tokens", 0)
+                        or getattr(resp.usage, "total_tokens", 0)
+                        or 0
+                    )
+        except Exception as emb_err:
+            print(f"[OpenAIAdapter] Embedding fallback notice ({type(emb_err).__name__}): using lexical/deterministic fallback.")
+            vectors = [deterministic_local_embedding(t, dimensions=dimensions) for t in sanitized]
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            return vectors, {
+                "provider": "local_deterministic_fallback",
+                "model": f"fallback-{dimensions}d",
+                "service_tier": "auto",
+                "input_tokens": 0,
+                "cached_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "latency_ms": latency_ms,
+            }
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
         cost_usd = calculate_openai_cost_usd(
@@ -383,28 +429,40 @@ class OpenAIProviderAdapter:
         self,
         *,
         text: str,
-        voice: str = "alloy",
-        model: str = "gpt-4o-mini-tts",
+        voice: str = "coral",
+        model: str = "tts-1-hd",
         instructions: Optional[str] = None,
     ) -> tuple[bytes, Dict[str, Any]]:
         if not self.is_configured:
             raise RuntimeError("OPENAI_API_KEY is not configured.")
 
-        clean_text = (text or "").strip()[:1200]
+        clean_text = (text or "").strip()[:3600]
         if not clean_text:
             raise ValueError("Speech input text is empty.")
 
+        tts1_voices = {"alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"}
+        nextgen_only_voices = {"marin", "cedar", "ballad", "verse"}
+        req_voice = (voice or "coral").strip().lower()
         t0 = time.perf_counter()
-        attempts = [model]
-        if model != "tts-1":
-            attempts.append("tts-1")
+        attempts: List[str] = []
+        preferred_order = (
+            ("gpt-4o-mini-tts", "tts-1-hd", "tts-1")
+            if req_voice in nextgen_only_voices
+            else (model, "tts-1-hd", "gpt-4o-mini-tts", "tts-1")
+        )
+        for cand in preferred_order:
+            if cand and cand not in attempts:
+                attempts.append(cand)
 
         last_err: Optional[Exception] = None
         for idx, m_name in enumerate(attempts):
             try:
+                effective_voice = req_voice
+                if m_name in ("tts-1-hd", "tts-1") and effective_voice not in tts1_voices:
+                    effective_voice = "coral"
                 kwargs: Dict[str, Any] = {
                     "model": m_name,
-                    "voice": voice,
+                    "voice": effective_voice,
                     "input": clean_text,
                     "response_format": "mp3",
                 }
@@ -420,7 +478,9 @@ class OpenAIProviderAdapter:
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 est_tokens = max(1, len(clean_text) // 4)
                 est_audio_tokens = max(10, int(len(audio_bytes) / 160))
-                if m_name == "tts-1":
+                if m_name == "tts-1-hd":
+                    cost_usd = round((len(clean_text) / 1_000_000.0) * 30.0, 6)
+                elif m_name == "tts-1":
                     cost_usd = round((len(clean_text) / 1_000_000.0) * 15.0, 6)
                 else:
                     cost_usd = round(

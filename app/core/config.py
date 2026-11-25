@@ -17,8 +17,9 @@ class Settings(BaseSettings):
     openai_embedding_dimensions: int = 1536
     openai_model_fast: str = "gpt-6-luna"
     openai_model_balanced: str = "gpt-6.1-terra"
-    openai_model_deep: str = "gpt-6.1-sol"
-    openai_tts_model: str = "gpt-4o-mini-tts"
+    openai_model_deep: str = "gpt-6.1-terra"
+    openai_tts_model: str = "tts-1-hd"
+    openai_tts_default_voice: str = "marin"
     openai_store_completions: bool = False
     openai_timeout_seconds: float = 35.0
 
