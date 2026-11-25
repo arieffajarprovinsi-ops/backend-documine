@@ -86,7 +86,13 @@ class DocumentInfo(BaseModel):
 class DocumentUpdateRequest(BaseModel):
     title: Optional[str] = None
     category: Optional[str] = None
+    summary: Optional[str] = None
+    primary_domain: Optional[str] = None
     user_tags: Optional[List[str]] = None
+
+
+class ChunkUpdateRequest(BaseModel):
+    text_content: str = Field(..., min_length=1, max_length=20000)
 
 
 # --- ECharts & Personalized Dashboard Schemas (Pillar B - DOC-14, DOC-15) ---

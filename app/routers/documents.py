@@ -9,7 +9,13 @@ from app.core.config import settings
 from app.core.hardening import analytics_report_cache, sanitize_header_filename
 from app.core.workspace import WorkspaceContext, get_verified_workspace_context
 from app.db.supabase_client import supabase_db
-from app.models.schemas import DocumentInfo, DocumentChunk, DocumentUpdateRequest, BoundingBox
+from app.models.schemas import (
+    DocumentInfo,
+    DocumentChunk,
+    DocumentUpdateRequest,
+    ChunkUpdateRequest,
+    BoundingBox,
+)
 from app.services.pdf_service import pdf_processor
 from app.services.storage_service import storage_service
 from app.worker import dispatch_ingestion_job
@@ -307,7 +313,7 @@ async def update_document_metadata(
     req: DocumentUpdateRequest,
     ctx: WorkspaceContext = Depends(get_verified_workspace_context),
 ):
-    doc = supabase_db.get_workspace_document(ctx.workspace_id, document_id)
+    doc = await asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found in your workspace.")
 
@@ -316,10 +322,16 @@ async def update_document_metadata(
         updates["title"] = req.title.strip()
     if req.category is not None:
         updates["category"] = req.category.strip()
+    if req.summary is not None:
+        updates["summary"] = req.summary.strip()
+    if req.primary_domain is not None:
+        updates["primary_domain"] = req.primary_domain.strip()
     if req.user_tags is not None:
         updates["user_tags"] = [t.strip() for t in req.user_tags if t and t.strip()]
 
-    updated = supabase_db.update_document(ctx.workspace_id, document_id, updates) or {**doc, **updates}
+    updated = await asyncio.to_thread(
+        supabase_db.update_document, ctx.workspace_id, document_id, updates
+    ) or {**doc, **updates}
     analytics_report_cache.invalidate_prefix(f"an:{ctx.workspace_id}:")
     return _row_to_document_info(updated)
 
@@ -404,11 +416,13 @@ async def get_document_chunks(
     document_id: str,
     ctx: WorkspaceContext = Depends(get_verified_workspace_context),
 ):
-    doc = supabase_db.get_workspace_document(ctx.workspace_id, document_id)
+    doc, raw_chunks = await asyncio.gather(
+        asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, document_id),
+        asyncio.to_thread(supabase_db.get_document_chunks, ctx.workspace_id, document_id),
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found in your workspace.")
 
-    raw_chunks = supabase_db.get_document_chunks(ctx.workspace_id, document_id)
     result: List[DocumentChunk] = []
     for c in raw_chunks:
         raw_boxes = c.get("bounding_boxes") or []
@@ -434,6 +448,46 @@ async def get_document_chunks(
             )
         )
     return result
+
+
+@router.patch("/{document_id}/chunks/{chunk_id}", response_model=DocumentChunk)
+async def update_document_chunk_text(
+    document_id: str,
+    chunk_id: str,
+    req: ChunkUpdateRequest,
+    ctx: WorkspaceContext = Depends(get_verified_workspace_context),
+):
+    doc = await asyncio.to_thread(supabase_db.get_workspace_document, ctx.workspace_id, document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found in your workspace.")
+
+    updated = await asyncio.to_thread(
+        supabase_db.update_document_chunk,
+        ctx.workspace_id,
+        document_id,
+        chunk_id,
+        req.text_content,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Document chunk not found in your workspace.")
+
+    raw_boxes = updated.get("bounding_boxes") or []
+    boxes = [BoundingBox(**b) if isinstance(b, dict) else b for b in raw_boxes]
+    txt = updated.get("text_content") or updated.get("content") or req.text_content
+    return DocumentChunk(
+        id=str(updated["id"]),
+        document_id=document_id,
+        doc_id=document_id,
+        workspace_id=ctx.workspace_id,
+        chunk_index=int(updated.get("chunk_index", 0)),
+        content=txt,
+        text_content=txt,
+        page_number=int(updated.get("page_number", 1)),
+        bounding_boxes=boxes,
+        token_count=updated.get("token_count"),
+        has_table=bool(updated.get("has_table", False)),
+        metadata=updated.get("metadata") or {},
+    )
 
 
 @router.delete("/{document_id}")
